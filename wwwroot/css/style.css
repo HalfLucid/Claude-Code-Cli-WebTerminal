@@ -1,0 +1,96 @@
+html,body{margin:0;height:100dvh;width:100vw;background:#000;overflow:hidden;font-family:monospace}
+
+/* Tab bar */
+#tab-bar{position:fixed;top:0;left:0;right:0;height:36px;background:#0d1117;border-bottom:1px solid #21262d;display:none;align-items:stretch;z-index:40;user-select:none;-webkit-user-select:none}
+body.has-tabs #tab-bar{display:flex}
+.tab-scroll-btn{background:#0d1117;color:#484f58;border:none;padding:0 8px;font:14px monospace;cursor:pointer;flex-shrink:0}
+.tab-scroll-btn:hover{color:#c9d1d9}
+#tab-list{display:flex;overflow:hidden;flex:1;scroll-behavior:smooth}
+.tab{display:flex;align-items:center;gap:6px;padding:0 12px;min-width:80px;max-width:160px;background:transparent;border-bottom:2px solid;color:#8b949e;font:13px monospace;cursor:pointer;white-space:nowrap;flex-shrink:0;transition:background 0.15s}
+.tab:hover{background:rgba(255,255,255,0.04)}
+.tab.active{color:#fff}
+.tab-label{overflow:hidden;text-overflow:ellipsis}
+.tab-close{background:none;border:none;color:#8b949e;font:14px monospace;cursor:pointer;padding:0 2px;line-height:1;display:none}
+.tab.active .tab-close{display:inline}
+.tab-close:hover{color:#f85149}
+.tab-new-btn{background:#0d1117;color:#58a6ff;border:none;border-left:1px solid #21262d;padding:0 12px;font:18px monospace;cursor:pointer;flex-shrink:0}
+
+/* Terminal containers */
+#terminals{position:fixed;inset:0;height:100dvh;width:100vw}
+body.has-tabs #terminals{top:37px;height:calc(100dvh - 37px)}
+.term-container{position:absolute;inset:0;display:none}
+.term-container.active{display:block}
+.term-container .xterm,.term-container .xterm-viewport,.term-container .xterm-screen{height:100% !important;width:100% !important}
+
+/* Hidden textarea */
+#ta{position:fixed;inset:0;width:100%;height:100%;background:transparent;color:transparent;caret-color:transparent;text-shadow:none;-webkit-text-fill-color:transparent;border:0;outline:0;resize:none;padding:0;font-size:16px;z-index:10;-webkit-user-select:text;user-select:text}
+body.has-tabs #ta{top:37px;height:calc(100dvh - 37px)}
+
+/* Button bar */
+.btnbar{position:fixed;right:env(safe-area-inset-right,8px);top:calc(env(safe-area-inset-top,0px) + 32px);z-index:20;display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+body.has-tabs .btnbar{top:calc(env(safe-area-inset-top,0px) + 69px)}
+#blist{display:flex;flex-direction:column;gap:6px;align-items:flex-end}
+.btn{background:#2a3340;color:#bde;border:1px solid #4a6680;border-radius:8px;padding:10px 12px;min-width:56px;font:14px monospace;opacity:0.55;transition:opacity .15s;-webkit-tap-highlight-color:transparent;touch-action:manipulation;text-align:center;cursor:pointer}
+.btn:hover,.btn:active{opacity:0.95}
+.btn.nav{background:#402a3a;color:#fbd;border-color:#80506a}
+.pager{display:flex;gap:6px;justify-content:center}
+.pager-btn{min-width:40px;padding:8px 10px;font-size:12px}
+
+/* Popout panel */
+.popout{position:fixed;right:80px;z-index:21;background:#1c2333;border:1px solid #4a6680;border-radius:8px;padding:8px;display:none;flex-direction:column;gap:4px;box-shadow:0 4px 12px rgba(0,0,0,0.5)}
+.popout-option{background:#2a3340;color:#bde;border:1px solid #4a6680;border-radius:6px;padding:10px 16px;font:14px monospace;cursor:pointer;text-align:center;touch-action:manipulation}
+.popout-option:hover,.popout-option:active{background:#3a4a5a}
+
+/* Banner */
+#banner{position:fixed;left:0;right:0;top:0;z-index:30;background:#552a2a;color:#fdd;font:13px monospace;padding:6px 10px;text-align:center;display:none}
+body.has-tabs #banner{top:37px}
+
+/* Main screen */
+#main-screen{position:fixed;inset:0;z-index:50;background:#0d1117;display:flex;flex-direction:column;overflow-y:auto;-webkit-overflow-scrolling:touch}
+.main-header{display:flex;justify-content:space-between;align-items:center;padding:20px 24px 12px;border-bottom:1px solid #21262d}
+.main-title{color:#c9d1d9;font:600 22px monospace;margin:0}
+.main-settings-btn{background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:6px;padding:8px 14px;font:13px monospace;cursor:pointer}
+.main-settings-btn:hover{background:#30363d;color:#c9d1d9}
+.main-body{padding:20px 24px;max-width:640px;margin:0 auto;width:100%;box-sizing:border-box}
+.launch-section{margin-bottom:28px}
+.section-title{color:#8b949e;font:600 14px monospace;margin:0 0 12px;text-transform:uppercase;letter-spacing:1px}
+.launch-btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:8px;padding:14px 20px;font:15px monospace;cursor:pointer;touch-action:manipulation}
+.launch-btn:hover,.launch-btn:active{background:#30363d}
+.powershell-btn{min-width:200px}
+.project-card{background:#161b22;border-radius:8px;padding:14px 16px;margin-bottom:10px;border-left:4px solid}
+.project-name{color:#c9d1d9;font:600 15px monospace;display:block}
+.project-dir{color:#484f58;font:12px monospace;display:block;margin:4px 0 10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.project-actions{display:flex;gap:8px;flex-wrap:wrap}
+.project-edit-btn,.project-delete-btn{background:none;border:1px solid #30363d;color:#8b949e;border-radius:6px;padding:8px 12px;font:13px monospace;cursor:pointer}
+.project-edit-btn:hover{color:#58a6ff;border-color:#58a6ff}
+.project-delete-btn:hover{color:#f85149;border-color:#f85149}
+.add-project-btn{background:transparent;color:#58a6ff;border:1px dashed #30363d;border-radius:8px;padding:12px;width:100%;font:14px monospace;cursor:pointer;margin-top:8px;box-sizing:border-box}
+.add-project-btn:hover{border-color:#58a6ff;background:rgba(88,166,255,0.05)}
+
+/* Modals */
+.modal-overlay{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,0.8);display:none;align-items:center;justify-content:center;padding:20px}
+.modal-overlay.visible{display:flex}
+.modal-card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;max-width:420px;width:100%;box-sizing:border-box}
+.modal-card h3{color:#c9d1d9;font:600 18px monospace;margin:0 0 16px}
+.modal-card label{display:block;color:#8b949e;font:13px monospace;margin-bottom:12px}
+.modal-card input[type="text"],.modal-card input[type="color"]{display:block;width:100%;margin-top:4px;padding:8px 10px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;font:14px monospace;box-sizing:border-box}
+.modal-card input[type="color"]{height:40px;padding:4px;cursor:pointer}
+.modal-actions{display:flex;gap:8px;margin-top:18px}
+.modal-actions button{flex:1;padding:10px;border-radius:6px;font:14px monospace;cursor:pointer;border:1px solid #30363d}
+.modal-save{background:#238636;color:#fff;border-color:#238636 !important}
+.modal-save:hover{background:#2ea043}
+.modal-cancel{background:#21262d;color:#c9d1d9}
+.modal-cancel:hover{background:#30363d}
+
+/* Button config modal */
+.btn-config-list{max-height:50vh;overflow-y:auto;margin-bottom:16px}
+.btn-config-item{display:flex;align-items:center;gap:8px;padding:8px;background:#0d1117;border:1px solid #21262d;border-radius:6px;margin-bottom:4px}
+.btn-config-label{flex:1;color:#c9d1d9;font:13px monospace}
+.btn-config-move{background:#21262d;color:#8b949e;border:1px solid #30363d;border-radius:4px;width:28px;height:28px;font:12px monospace;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.btn-config-move:hover{color:#c9d1d9;background:#30363d}
+.btn-config-delete{background:none;border:1px solid #30363d;color:#f85149;border-radius:4px;width:28px;height:28px;font:14px monospace;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.btn-config-delete:hover{background:rgba(248,81,73,0.1)}
+.custom-btn-form{border-top:1px solid #21262d;padding-top:12px;margin-top:8px}
+.custom-btn-form input{width:calc(50% - 8px);display:inline-block;margin-right:8px;padding:8px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;font:13px monospace;box-sizing:border-box}
+.custom-btn-add{background:#238636;color:#fff;border:none;border-radius:6px;padding:8px 16px;font:13px monospace;cursor:pointer;margin-top:8px}
+.custom-btn-add:hover{background:#2ea043}

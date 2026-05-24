@@ -1,0 +1,78 @@
+<!doctype html><html><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover"/>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css"/>
+<link rel="stylesheet" href="css/style.css"/>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+</head><body>
+<div id="banner"></div>
+<div id="tab-bar">
+  <button class="tab-scroll-btn" id="tab-scroll-left">&#9664;</button>
+  <div id="tab-list"></div>
+  <button class="tab-scroll-btn" id="tab-scroll-right">&#9654;</button>
+  <button class="tab-new-btn" id="tab-new" title="New session">+</button>
+</div>
+<div id="terminals"></div>
+<textarea id="ta" autocapitalize="off" autocomplete="off" autocorrect="on" spellcheck="true"></textarea>
+<div class="btnbar">
+  <div class="btn nav" id="btoggle" role="button">&#8595;</div>
+  <div id="blist"></div>
+</div>
+<div id="popout" class="popout"></div>
+<div id="main-screen">
+  <div class="main-header">
+    <h1 class="main-title">WebTerm</h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="main-settings-btn" id="btn-back-to-session" style="display:none;background:#238636;color:#fff;border-color:#238636">&#9664; Back</button>
+      <button class="main-settings-btn" id="btn-startup">Startup: ...</button>
+      <button class="main-settings-btn" id="btn-button-config">&#9881; Buttons</button>
+    </div>
+  </div>
+  <div class="main-body">
+    <div class="launch-section">
+      <h2 class="section-title">Quick Launch</h2>
+      <button class="launch-btn powershell-btn" id="launch-powershell">&#9654; PowerShell</button>
+    </div>
+    <div class="launch-section">
+      <h2 class="section-title">Claude Projects</h2>
+      <div id="project-list"></div>
+      <button class="add-project-btn" id="btn-add-project">+ Add Project</button>
+    </div>
+  </div>
+</div>
+<div id="project-modal" class="modal-overlay">
+  <div class="modal-card">
+    <h3 id="project-modal-title">New Project</h3>
+    <label>Name<input type="text" id="proj-name" placeholder="My Project"/></label>
+    <label>Directory<input type="text" id="proj-dir" placeholder="C:\path\to\project"/></label>
+    <label>Color<input type="color" id="proj-color" value="#4a90d9"/></label>
+    <div class="modal-actions">
+      <button class="modal-save" id="proj-save">Save</button>
+      <button class="modal-cancel" id="proj-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+<div id="button-config-modal" class="modal-overlay">
+  <div class="modal-card">
+    <h3>Button Configuration</h3>
+    <div class="btn-config-list" id="btn-config-list"></div>
+    <div class="custom-btn-form">
+      <input type="text" id="custom-btn-label" placeholder="Label"/>
+      <input type="text" id="custom-btn-command" placeholder="Command (e.g. /help\r)"/>
+      <button class="custom-btn-add" id="custom-btn-add">+ Add Button</button>
+    </div>
+    <div class="modal-actions">
+      <button class="modal-save" id="btn-config-save">Save</button>
+      <button class="modal-cancel" id="btn-config-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+<script src="js/settings.js"></script>
+<script src="js/terminal.js"></script>
+<script src="js/connection.js"></script>
+<script src="js/buttons.js"></script>
+<script src="js/tabs.js"></script>
+<script src="js/mainscreen.js"></script>
+<script src="js/app.js"></script>
+</body></html>
