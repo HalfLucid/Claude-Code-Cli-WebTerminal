@@ -81,10 +81,9 @@ window.ButtonBar = (function(){
     if(!expanded){
       blist.style.display = 'flex';
       btoggle.innerHTML = '&#8595;';
-      const order = buttonOrder || Object.keys(BUILTIN_BUTTONS);
-      for(const key of order){
+      for(const key of Object.keys(BUILTIN_BUTTONS)){
         const b = BUILTIN_BUTTONS[key];
-        if(b && b.minimizedOnly) blist.appendChild(makeBtn('', b.label, b.fn));
+        if(b.minimizedOnly) blist.appendChild(makeBtn('', b.label, b.fn));
       }
       return;
     }
