@@ -10,7 +10,7 @@ window.TabManager = (function(){
     });
   }
 
-  function createTab(kind, projectId, label, color){
+  function createTab(kind, projectId, label, color, defaultCommand){
     const id = uuid();
     const sid = uuid();
     const containerEl = TerminalManager.createContainer(id);
@@ -20,6 +20,7 @@ window.TabManager = (function(){
       id, sid, kind, projectId,
       label: label || kind,
       color: color || '#1e6f1e',
+      defaultCommand: defaultCommand || null,
       term, fitAddon, containerEl,
       ws: null,
       reconnectDelay: 500,
@@ -84,6 +85,7 @@ window.TabManager = (function(){
     if(!confirm('Close "' + tabs[index].label + '" session?')) return;
 
     const tab = tabs[index];
+    fetch('/api/sessions/' + encodeURIComponent(tab.sid), { method: 'DELETE' }).catch(() => {});
     Connection.disconnect(tab);
     TerminalManager.destroyTerminal(tab.term, tab.containerEl);
     tabs.splice(index, 1);
@@ -104,6 +106,7 @@ window.TabManager = (function(){
   function removeStaleTab(tab){
     const index = tabs.indexOf(tab);
     if(index < 0) return;
+    fetch('/api/sessions/' + encodeURIComponent(tab.sid), { method: 'DELETE' }).catch(() => {});
     Connection.disconnect(tab);
     TerminalManager.destroyTerminal(tab.term, tab.containerEl);
     tabs.splice(index, 1);
@@ -211,8 +214,31 @@ window.TabManager = (function(){
     return null;
   }
 
+  function createExternalTab(sid, kind, projectId, label, color){
+    const id = uuid();
+    const containerEl = TerminalManager.createContainer(id);
+    const { term, fitAddon } = TerminalManager.createTerminal(containerEl);
+
+    const tab = {
+      id, sid, kind, projectId,
+      label: label || kind,
+      color: color || '#1e6f1e',
+      defaultCommand: null,
+      term, fitAddon, containerEl,
+      ws: null,
+      reconnectDelay: 500,
+      reconnectTimer: null,
+      restored: true
+    };
+
+    tabs.push(tab);
+    Connection.connect(tab);
+    saveTabs();
+    return tab;
+  }
+
   return {
-    createTab, restoreTab, switchTo, closeTab, removeStaleTab,
+    createTab, createExternalTab, restoreTab, switchTo, closeTab, removeStaleTab,
     renderTabBar, getActive, getAll,
     showMainScreen, hideMainScreen,
     loadSavedTabs, getSavedActiveIndex, migrateOldSid,

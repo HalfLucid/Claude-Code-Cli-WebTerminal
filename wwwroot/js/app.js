@@ -82,33 +82,35 @@
     ButtonBar.render();
   }
 
-  // Restore tabs or show main screen
-  const oldSid = TabManager.migrateOldSid();
-  const savedTabs = TabManager.loadSavedTabs();
-
-  if(savedTabs.length > 0){
-    savedTabs.forEach(t => TabManager.restoreTab(t));
-    const savedActive = TabManager.getSavedActiveIndex();
-    const all = TabManager.getAll();
-    TabManager.switchTo(Math.min(savedActive, all.length - 1));
-  } else if(oldSid){
-    // Migration from single-session
-    const id = crypto.randomUUID ? crypto.randomUUID() : Date.now().toString();
-    const containerEl = TerminalManager.createContainer(id);
-    const { term, fitAddon } = TerminalManager.createTerminal(containerEl);
-    // Create a powershell-like tab from the old sid
-    TabManager.getAll().push({
-      id, sid: oldSid, kind: 'powershell', projectId: null,
-      label: 'Session', color: '#1e6f1e',
-      term, fitAddon, containerEl,
-      ws: null, reconnectDelay: 500, reconnectTimer: null
-    });
-    TabManager.switchTo(0);
-    Connection.connect(TabManager.getActive());
-    TabManager.saveTabs();
-  } else {
+  // Restore tabs from server session registry
+  try {
+    const res = await fetch('/api/sessions');
+    const serverSessions = await res.json();
+    if(serverSessions.length > 0){
+      serverSessions.forEach(s => TabManager.createExternalTab(s.sid, s.kind, s.projectId, s.label, s.color));
+      TabManager.switchTo(0);
+    } else {
+      TabManager.showMainScreen();
+    }
+  } catch {
     TabManager.showMainScreen();
   }
+
+  // SSE: listen for server-pushed tab events (MCP, cross-device)
+  (function initSSE(){
+    var es = new EventSource('/api/events');
+    es.addEventListener('tab_opened', function(e){
+      var data = JSON.parse(e.data);
+      if(TabManager.getAll().find(function(t){ return t.sid === data.sid; })) return;
+      TabManager.createExternalTab(data.sid, data.kind, data.projectId, data.label, data.color);
+      TabManager.renderTabBar();
+    });
+    es.addEventListener('tab_closed', function(e){
+      var data = JSON.parse(e.data);
+      var tab = TabManager.getAll().find(function(t){ return t.sid === data.sid; });
+      if(tab) TabManager.removeStaleTab(tab);
+    });
+  })();
 
   ta.focus();
 })();

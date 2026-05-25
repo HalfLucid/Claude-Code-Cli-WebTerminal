@@ -89,8 +89,8 @@ window.MainScreen = (function(){
     });
   }
 
-  function launchSession(kind, projectId, label, color){
-    TabManager.createTab(kind, projectId, label, color);
+  function launchSession(kind, projectId, label, color, defaultCommand){
+    TabManager.createTab(kind, projectId, label, color, defaultCommand);
   }
 
   document.getElementById('btn-back-to-session').addEventListener('click', () => {
@@ -99,6 +99,18 @@ window.MainScreen = (function(){
       TabManager.hideMainScreen();
     } else if(TabManager.getAll().length > 0){
       TabManager.switchTo(0);
+    }
+  });
+
+  document.getElementById('btn-add-mcp').addEventListener('click', async () => {
+    try {
+      const res = await fetch('/api/mcp-setup', { method: 'POST' });
+      const data = await res.json();
+      const settings = Settings.getCached();
+      const color = (settings && settings.defaultPowershellColor) || '#1e6f1e';
+      launchSession('powershell', null, 'Add MCP', color, data.command);
+    } catch(e) {
+      alert('MCP setup failed: ' + e.message);
     }
   });
 

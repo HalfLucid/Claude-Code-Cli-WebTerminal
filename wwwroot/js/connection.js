@@ -26,8 +26,9 @@ window.Connection = (function(){
               TabManager.removeStaleTab(tab);
               return;
             }
-            const msg = JSON.stringify({launch: tab.kind, projectId: tab.projectId || undefined});
+            const msg = JSON.stringify({launch: tab.kind, projectId: tab.projectId || undefined, defaultCommand: tab.defaultCommand || undefined, label: tab.label || undefined, color: tab.color || undefined});
             tab.ws.send(msg);
+            tab.defaultCommand = null;
           }
         }catch{}
         return;

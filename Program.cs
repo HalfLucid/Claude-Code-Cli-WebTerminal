@@ -40,10 +40,26 @@ var expected = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{authU
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
+string GetClientIp(HttpContext ctx)
+{
+    var forwarded = ctx.Request.Headers["X-Forwarded-For"].FirstOrDefault();
+    if (!string.IsNullOrEmpty(forwarded)) return forwarded.Split(',')[0].Trim();
+    return ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+}
+
+void Log(string message) => Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+
 app.Use(async (ctx, next) =>
 {
+    if (ctx.Request.Path == "/mcp")
+    {
+        await next();
+        return;
+    }
     if (ctx.Request.Headers.Authorization != expected)
     {
+        var ip = GetClientIp(ctx);
+        Log($"AUTH DENIED from {ip} — {ctx.Request.Method} {ctx.Request.Path}");
         ctx.Response.Headers["WWW-Authenticate"] = "Basic realm=\"webterm\"";
         ctx.Response.StatusCode = 401;
         return;
@@ -57,6 +73,21 @@ app.UseDefaultFiles();
 app.UseStaticFiles();
 
 var sessions = new ConcurrentDictionary<string, Session>();
+var sseClients = new ConcurrentDictionary<string, Channel<string>>();
+
+void BroadcastSse(string eventType, object data)
+{
+    var json = JsonSerializer.Serialize(data);
+    var message = $"event: {eventType}\ndata: {json}\n\n";
+    foreach (var kv in sseClients)
+    {
+        if (!kv.Value.Writer.TryWrite(message))
+        {
+            sseClients.TryRemove(kv.Key, out _);
+            kv.Value.Writer.TryComplete();
+        }
+    }
+}
 
 _ = Task.Run(async () =>
 {
@@ -67,7 +98,11 @@ _ = Task.Run(async () =>
         foreach (var kv in sessions)
         {
             if (kv.Value.IsIdleSince(cutoff) && sessions.TryRemove(kv.Key, out var s))
+            {
+                Log($"SESSION REAPED sid={kv.Key[..8]}… (idle 30m, {s.Stats})");
                 s.Dispose();
+                BroadcastSse("tab_closed", new { sid = kv.Key });
+            }
         }
     }
 });
@@ -165,6 +200,278 @@ app.MapPost("/api/startup", async (HttpContext ctx) =>
     return Results.Json(new { enabled = File.Exists(shortcutPath) });
 });
 
+app.MapGet("/api/sessions", () =>
+{
+    var list = sessions.Select(kv => new
+    {
+        sid = kv.Key,
+        kind = kv.Value.Kind ?? "unknown",
+        label = kv.Value.Label ?? "unknown",
+        color = kv.Value.Color ?? "#1e6f1e",
+        projectId = kv.Value.ProjectId,
+        launched = kv.Value.IsLaunched,
+        connected = kv.Value.HasWebSocket
+    }).ToArray();
+    return Results.Json(list);
+});
+
+app.MapDelete("/api/sessions/{sid}", (string sid) =>
+{
+    if (!sessions.TryRemove(sid, out var session))
+        return Results.NotFound(new { error = "Session not found" });
+
+    Log($"SESSION CLOSED sid={sid[..Math.Min(8, sid.Length)]}… (client request, {session.Stats})");
+    session.Dispose();
+    BroadcastSse("tab_closed", new { sid });
+    return Results.Ok(new { closed = sid });
+});
+
+app.MapGet("/api/events", async (HttpContext ctx) =>
+{
+    ctx.Response.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+    ctx.Response.Headers["X-Accel-Buffering"] = "no";
+
+    var clientId = Guid.NewGuid().ToString();
+    var channel = Channel.CreateBounded<string>(new BoundedChannelOptions(64)
+    {
+        FullMode = BoundedChannelFullMode.DropOldest,
+        SingleReader = true
+    });
+    sseClients[clientId] = channel;
+
+    try
+    {
+        await ctx.Response.WriteAsync(": connected\n\n");
+        await ctx.Response.Body.FlushAsync();
+
+        await foreach (var message in channel.Reader.ReadAllAsync(ctx.RequestAborted))
+        {
+            await ctx.Response.WriteAsync(message);
+            await ctx.Response.Body.FlushAsync();
+        }
+    }
+    catch (OperationCanceledException) { }
+    finally
+    {
+        sseClients.TryRemove(clientId, out _);
+        channel.Writer.TryComplete();
+    }
+});
+
+app.MapPost("/api/mcp-setup", () =>
+{
+    var current = sm.Load();
+    string mcpKey;
+    if (!string.IsNullOrEmpty(current.McpKeyProtected))
+    {
+        mcpKey = SettingsManager.Unprotect(current.McpKeyProtected);
+    }
+    else
+    {
+        var keyBytes = RandomNumberGenerator.GetBytes(32);
+        mcpKey = Convert.ToBase64String(keyBytes).Replace("+", "-").Replace("/", "_").TrimEnd('=');
+        current.McpKeyProtected = SettingsManager.Protect(mcpKey);
+        sm.Save(current);
+        Log("MCP key generated and saved");
+    }
+    var url = $"http://localhost:7681/mcp?token={Uri.EscapeDataString(mcpKey)}";
+    var command = $"claude mcp add webterm --transport http \"{url}\" -s user";
+    return Results.Json(new { command, url });
+});
+
+app.MapPost("/mcp", async (HttpContext ctx) =>
+{
+    var token = ctx.Request.Query["token"].ToString();
+    var current = sm.Load();
+    if (string.IsNullOrEmpty(current.McpKeyProtected) || string.IsNullOrEmpty(token))
+    {
+        ctx.Response.StatusCode = 401;
+        await ctx.Response.WriteAsJsonAsync(new { error = "Missing MCP token" });
+        return;
+    }
+    try
+    {
+        var expectedKey = SettingsManager.Unprotect(current.McpKeyProtected);
+        if (token != expectedKey)
+        {
+            ctx.Response.StatusCode = 401;
+            await ctx.Response.WriteAsJsonAsync(new { error = "Invalid MCP token" });
+            return;
+        }
+    }
+    catch
+    {
+        ctx.Response.StatusCode = 401;
+        await ctx.Response.WriteAsJsonAsync(new { error = "Token validation failed" });
+        return;
+    }
+
+    JsonElement req;
+    try { req = await ctx.Request.ReadFromJsonAsync<JsonElement>(); }
+    catch
+    {
+        await ctx.Response.WriteAsJsonAsync(McpError(null, -32700, "Parse error"));
+        return;
+    }
+
+    var id = req.TryGetProperty("id", out var idProp) ? idProp : (JsonElement?)null;
+    var method = req.TryGetProperty("method", out var m) ? m.GetString() : null;
+
+    object response = method switch
+    {
+        "initialize" => McpResult(id, new
+        {
+            protocolVersion = "2024-11-05",
+            serverInfo = new { name = "webterm", version = "1.0.0" },
+            capabilities = new { tools = new { } }
+        }),
+        "notifications/initialized" => McpResult(id, new { }),
+        "tools/list" => McpResult(id, new
+        {
+            tools = new object[]
+            {
+                McpToolDef("open_tab",
+                    "Open a new terminal tab in WebTerm. Creates a PTY session and notifies the browser.",
+                    new
+                    {
+                        type = "object",
+                        properties = new Dictionary<string, object>
+                        {
+                            ["kind"] = new { type = "string", description = "Session type", @enum = new[] { "powershell", "claude", "claude-resume" } },
+                            ["projectId"] = new { type = "string", description = "Project ID (required for claude/claude-resume)" },
+                            ["label"] = new { type = "string", description = "Tab label shown in browser" },
+                            ["command"] = new { type = "string", description = "Command to execute after launch" }
+                        },
+                        required = new[] { "kind" }
+                    }),
+                McpToolDef("close_tab",
+                    "Close a terminal tab by session ID.",
+                    new
+                    {
+                        type = "object",
+                        properties = new Dictionary<string, object>
+                        {
+                            ["sid"] = new { type = "string", description = "Session ID to close" }
+                        },
+                        required = new[] { "sid" }
+                    }),
+                McpToolDef("list_tabs",
+                    "List all active terminal sessions.",
+                    new { type = "object", properties = new Dictionary<string, object>() })
+            }
+        }),
+        "tools/call" => McpHandleToolCall(req, id),
+        _ => McpError(id, -32601, $"Method not found: {method}")
+    };
+
+    await ctx.Response.WriteAsJsonAsync(response);
+});
+
+object McpResult(JsonElement? id, object result) => new
+{
+    jsonrpc = "2.0",
+    id = id?.ValueKind == JsonValueKind.Number ? (object)id.Value.GetInt32()
+        : id?.ValueKind == JsonValueKind.String ? id.Value.GetString() : null,
+    result
+};
+
+object McpError(JsonElement? id, int code, string message) => new
+{
+    jsonrpc = "2.0",
+    id = id?.ValueKind == JsonValueKind.Number ? (object)id.Value.GetInt32()
+        : id?.ValueKind == JsonValueKind.String ? id.Value.GetString() : null,
+    error = new { code, message }
+};
+
+object McpToolDef(string name, string description, object inputSchema) => new { name, description, inputSchema };
+
+object McpHandleToolCall(JsonElement req, JsonElement? id)
+{
+    var toolName = req.GetProperty("params").GetProperty("name").GetString();
+    var args = req.GetProperty("params").TryGetProperty("arguments", out var a) ? a : default;
+
+    return toolName switch
+    {
+        "open_tab" => McpOpenTab(id, args),
+        "close_tab" => McpCloseTab(id, args),
+        "list_tabs" => McpListTabs(id),
+        _ => McpError(id, -32602, $"Unknown tool: {toolName}")
+    };
+}
+
+object McpOpenTab(JsonElement? id, JsonElement args)
+{
+    var kind = args.TryGetProperty("kind", out var k) ? k.GetString() ?? "powershell" : "powershell";
+    var projectId = args.TryGetProperty("projectId", out var p) ? p.GetString() : null;
+    var label = args.TryGetProperty("label", out var l) ? l.GetString() : kind;
+    var command = args.TryGetProperty("command", out var c) ? c.GetString() : null;
+
+    string color = "#1e6f1e";
+    if (kind != "powershell" && projectId != null)
+    {
+        var proj = sm.Load().Projects.FirstOrDefault(pr => pr.Id == projectId);
+        if (proj != null) color = proj.Color;
+    }
+
+    var sid = Guid.NewGuid().ToString();
+    var session = Session.Create(kind, label, color, projectId);
+    sessions[sid] = session;
+
+    var sidShort = sid[..8];
+    session.Launch(kind, projectId, sm, sidShort, Log, command);
+
+    BroadcastSse("tab_opened", new { sid, kind, label, color, projectId });
+    Log($"MCP OPEN sid={sidShort}… kind={kind} label={label}");
+
+    return McpResult(id, new
+    {
+        content = new[] { new { type = "text", text = $"Tab opened: sid={sid}, kind={kind}, label={label}" } }
+    });
+}
+
+object McpCloseTab(JsonElement? id, JsonElement args)
+{
+    var sid = args.TryGetProperty("sid", out var s) ? s.GetString() : null;
+    if (string.IsNullOrEmpty(sid))
+        return McpError(id, -32602, "Missing required parameter: sid");
+
+    if (!sessions.TryRemove(sid, out var session))
+        return McpResult(id, new
+        {
+            content = new[] { new { type = "text", text = $"No session found with sid={sid}" } },
+            isError = true
+        });
+
+    session.Dispose();
+    BroadcastSse("tab_closed", new { sid });
+    Log($"MCP CLOSE sid={sid[..8]}…");
+
+    return McpResult(id, new
+    {
+        content = new[] { new { type = "text", text = $"Tab closed: sid={sid}" } }
+    });
+}
+
+object McpListTabs(JsonElement? id)
+{
+    var tabList = sessions.Select(kv => new
+    {
+        sid = kv.Key,
+        kind = kv.Value.Kind ?? "unknown",
+        label = kv.Value.Label ?? "unknown",
+        color = kv.Value.Color ?? "#1e6f1e",
+        projectId = kv.Value.ProjectId,
+        launched = kv.Value.IsLaunched,
+        connected = kv.Value.HasWebSocket
+    }).ToArray();
+
+    return McpResult(id, new
+    {
+        content = new[] { new { type = "text", text = JsonSerializer.Serialize(tabList) } }
+    });
+}
+
 app.Map("/ws", async ctx =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = 400; return; }
@@ -174,9 +481,16 @@ app.Map("/ws", async ctx =>
         ctx.Response.StatusCode = 400;
         return;
     }
+    var ip = GetClientIp(ctx);
     var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-    var session = sessions.GetOrAdd(sid, _ => Session.Create());
-    await session.Attach(ws, sm);
+    var isNew = false;
+    var session = sessions.GetOrAdd(sid, _ => { isNew = true; return Session.Create(); });
+    var sidShort = sid[..8];
+    if (isNew)
+        Log($"SESSION NEW sid={sidShort}… from {ip}");
+    else
+        Log($"SESSION RECONNECT sid={sidShort}… from {ip}");
+    await session.Attach(ws, sm, sidShort, ip, Log);
 });
 
 var listenUrl = "http://0.0.0.0:7681";
@@ -230,17 +544,47 @@ sealed class Session : IDisposable
     bool _disposed;
     int _cols = 120, _rows = 30;
     bool _launched;
+    readonly DateTime _createdAt = DateTime.Now;
+    int _inputCount;
+    string? _kind;
+    string? _label;
+    string? _color;
+    string? _projectId;
 
-    public static Session Create() => new Session();
+    public static Session Create(string? kind = null, string? label = null, string? color = null, string? projectId = null)
+        => new Session { _kind = kind, _label = label, _color = color, _projectId = projectId };
+
+    public string Stats
+    {
+        get
+        {
+            var dur = DateTime.Now - _createdAt;
+            return $"age={FormatDuration(dur)}, inputs={_inputCount}";
+        }
+    }
+
+    static string FormatDuration(TimeSpan ts)
+    {
+        if (ts.TotalDays >= 1) return $"{(int)ts.TotalDays}d{ts.Hours}h{ts.Minutes}m";
+        if (ts.TotalHours >= 1) return $"{(int)ts.TotalHours}h{ts.Minutes}m";
+        return $"{(int)ts.TotalMinutes}m{ts.Seconds}s";
+    }
 
     public bool IsLaunched { get { lock (_lock) return _launched; } }
+    public string? Kind { get { lock (_lock) return _kind; } }
+    public string? Label { get { lock (_lock) return _label; } }
+    public string? Color { get { lock (_lock) return _color; } }
+    public string? ProjectId { get { lock (_lock) return _projectId; } }
+    public bool HasWebSocket { get { lock (_lock) return _current != null; } }
 
-    public void Launch(string kind, string? projectId, SettingsManager sm)
+    public void Launch(string kind, string? projectId, SettingsManager sm, string sidShort, Action<string> log, string? defaultCommand = null)
     {
         lock (_lock)
         {
             if (_launched) return;
             _launched = true;
+            _kind ??= kind;
+            _projectId ??= projectId;
         }
         var ps = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -248,10 +592,12 @@ sealed class Session : IDisposable
         string cwd;
         string[] cmd;
 
+        var rmPsrl = "Remove-Module PSReadLine -ErrorAction SilentlyContinue;";
+
         if (kind == "powershell")
         {
             cwd = home;
-            cmd = ["-NoExit"];
+            cmd = ["-NoExit", "-Command", rmPsrl];
         }
         else
         {
@@ -259,8 +605,10 @@ sealed class Session : IDisposable
             var project = current.Projects.FirstOrDefault(p => p.Id == projectId);
             cwd = project?.Directory ?? home;
             var claudeCmd = kind == "claude-resume" ? "claude --resume" : "claude";
-            cmd = ["-NoExit", "-Command", claudeCmd];
+            cmd = ["-NoExit", "-Command", $"{rmPsrl} {claudeCmd}"];
         }
+
+        log($"SESSION LAUNCH sid={sidShort}… kind={kind} cwd={cwd}");
 
         var opts = new PtyOptions
         {
@@ -274,6 +622,17 @@ sealed class Session : IDisposable
         };
         Pty = PtyProvider.SpawnAsync(opts, CancellationToken.None).GetAwaiter().GetResult();
         _ = Task.Run(ReadLoop);
+
+        if (!string.IsNullOrEmpty(defaultCommand))
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(500);
+                var bytes = System.Text.Encoding.UTF8.GetBytes(defaultCommand + "\r");
+                await Pty.WriterStream.WriteAsync(bytes);
+                await Pty.WriterStream.FlushAsync();
+            });
+        }
     }
 
     async Task ReadLoop()
@@ -308,7 +667,7 @@ sealed class Session : IDisposable
         catch { }
     }
 
-    public async Task Attach(WebSocket ws, SettingsManager sm)
+    public async Task Attach(WebSocket ws, SettingsManager sm, string sidShort, string ip, Action<string> log)
     {
         WebSocket? old;
         Channel<byte[]>? oldCh;
@@ -326,6 +685,7 @@ sealed class Session : IDisposable
         oldCh?.Writer.TryComplete();
         if (old != null)
         {
+            log($"WS REPLACED sid={sidShort}… old connection closed");
             try { await old.CloseAsync(WebSocketCloseStatus.NormalClosure, "replaced", default); } catch { }
         }
 
@@ -372,7 +732,17 @@ sealed class Session : IDisposable
                             string? projId = null;
                             if (root.TryGetProperty("projectId", out var pid) && pid.ValueKind == JsonValueKind.String)
                                 projId = pid.GetString();
-                            Launch(lk.GetString()!, projId, sm);
+                            string? defCmd = null;
+                            if (root.TryGetProperty("defaultCommand", out var dc) && dc.ValueKind == JsonValueKind.String)
+                                defCmd = dc.GetString();
+                            string? labelVal = null;
+                            if (root.TryGetProperty("label", out var lblProp) && lblProp.ValueKind == JsonValueKind.String)
+                                labelVal = lblProp.GetString();
+                            string? colorVal = null;
+                            if (root.TryGetProperty("color", out var clrProp) && clrProp.ValueKind == JsonValueKind.String)
+                                colorVal = clrProp.GetString();
+                            lock (_lock) { _label ??= labelVal; _color ??= colorVal; }
+                            Launch(lk.GetString()!, projId, sm, sidShort, log, defCmd);
                         }
                         else if (root.TryGetProperty("cols", out var c) && root.TryGetProperty("rows", out var rr))
                         {
@@ -385,6 +755,7 @@ sealed class Session : IDisposable
                     continue;
                 }
                 if (Pty == null) continue;
+                Interlocked.Increment(ref _inputCount);
                 await Pty.WriterStream.WriteAsync(buf2.AsMemory(0, r.Count));
                 await Pty.WriterStream.FlushAsync();
             }
@@ -402,6 +773,7 @@ sealed class Session : IDisposable
                     _lastDetached = DateTime.UtcNow;
                 }
             }
+            log($"WS DISCONNECTED sid={sidShort}… from {ip} ({Stats})");
             try { await sendPump; } catch { }
         }
     }
@@ -436,6 +808,9 @@ class WebtermSettings
 
     [JsonPropertyName("defaultPowershellColor")]
     public string DefaultPowershellColor { get; set; } = "#1e6f1e";
+
+    [JsonPropertyName("mcpKeyProtected")]
+    public string? McpKeyProtected { get; set; }
 }
 
 class CredentialSettings
