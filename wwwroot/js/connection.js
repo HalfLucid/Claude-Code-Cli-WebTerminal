@@ -88,6 +88,8 @@ window.Connection = (function(){
   function disconnect(tab){
     if(tab.reconnectTimer){ clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; }
     if(tab.ws){
+      tab.ws.onclose = null;
+      tab.ws.onerror = null;
       try{ tab.ws.close(); }catch{}
       tab.ws = null;
     }

@@ -253,7 +253,7 @@ app.MapPost("/api/restart", () =>
 
 app.MapGet("/api/sessions", () =>
 {
-    var list = sessions.Select(kv => new
+    var list = sessions.Where(kv => kv.Value.IsLaunched).Select(kv => new
     {
         sid = kv.Key,
         kind = kv.Value.Kind ?? "unknown",
@@ -680,24 +680,26 @@ sealed class Session : IDisposable
             _kind ??= kind;
             _projectId ??= projectId;
         }
-        var ps = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
+        string app;
         string cwd;
         string[] cmd;
 
         if (kind == "powershell")
         {
+            app = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
             cwd = home;
             cmd = ["-NoProfile", "-NoLogo", "-NoExit"];
         }
         else
         {
+            app = Path.Combine(Environment.SystemDirectory, "cmd.exe");
             var current = sm.Load();
             var project = current.Projects.FirstOrDefault(p => p.Id == projectId);
             cwd = project?.Directory ?? home;
             var claudeCmd = kind == "claude-resume" ? "claude --resume" : "claude";
-            cmd = ["-NoProfile", "-NoLogo", "-NoExit", "-Command", claudeCmd];
+            cmd = ["/K", claudeCmd];
         }
 
         log($"SESSION LAUNCH sid={sidShort}… kind={kind} cwd={cwd}");
@@ -708,7 +710,7 @@ sealed class Session : IDisposable
             Cols = _cols,
             Rows = _rows,
             Cwd = cwd,
-            App = ps,
+            App = app,
             CommandLine = cmd,
             Environment = new Dictionary<string, string>()
         };
