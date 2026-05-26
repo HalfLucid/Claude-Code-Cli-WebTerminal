@@ -114,6 +114,14 @@ window.MainScreen = (function(){
     }
   });
 
+  document.getElementById('btn-restart').addEventListener('click', async () => {
+    if(!confirm('Restart WebTerm server? All sessions will be killed.')) return;
+    try {
+      await fetch('/api/restart', { method: 'POST' });
+    } catch {}
+    setTimeout(() => { location.reload(); }, 3000);
+  });
+
   document.getElementById('launch-powershell').addEventListener('click', () => {
     const settings = Settings.getCached();
     const color = (settings && settings.defaultPowershellColor) || '#1e6f1e';
@@ -174,7 +182,7 @@ window.MainScreen = (function(){
   function openButtonConfig(){
     const settings = Settings.getCached();
     const btnConfig = settings?.buttons || {};
-    tempOrder = [...(btnConfig.order || ButtonBar.getBuiltinKeys())].filter(k => !ButtonBar.isMinimizedOnly(k));
+    tempOrder = [...btnConfig.order].filter(k => !ButtonBar.isMinimizedOnly(k));
     tempCustom = [...(btnConfig.custom || [])];
     renderButtonConfig();
     document.getElementById('button-config-modal').classList.add('visible');

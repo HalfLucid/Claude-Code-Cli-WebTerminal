@@ -11,6 +11,7 @@ window.TerminalManager = (function(){
     const term = new Terminal({
       fontSize: 14,
       cursorBlink: true,
+      cursorInactiveStyle: 'block',
       allowProposedApi: true,
       disableStdin: true,
       scrollback: 5000,
@@ -19,6 +20,12 @@ window.TerminalManager = (function(){
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
     term.open(containerEl);
+    const coreEl = containerEl.querySelector('.xterm');
+    if(coreEl){
+      const refocus = () => setTimeout(() => document.getElementById('ta').focus(), 0);
+      coreEl.addEventListener('mousedown', refocus);
+      coreEl.addEventListener('touchend', refocus);
+    }
     return { term, fitAddon };
   }
 

@@ -4,6 +4,16 @@ window.Settings = (function(){
   async function load(){
     const res = await fetch('/api/settings');
     cache = await res.json();
+    if(cache.bootId){
+      var prev = sessionStorage.getItem('bootId');
+      if(prev && prev !== cache.bootId){
+        sessionStorage.setItem('bootId', cache.bootId);
+        if('caches' in window) caches.keys().then(function(k){ k.forEach(function(n){ caches.delete(n); }); });
+        location.reload(true);
+        return cache;
+      }
+      sessionStorage.setItem('bootId', cache.bootId);
+    }
     return cache;
   }
 

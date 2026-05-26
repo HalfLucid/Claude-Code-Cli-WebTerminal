@@ -37,6 +37,8 @@ if (settings.Credentials is null)
 var (authUser, authPass) = sm.DecryptCredentials(settings.Credentials);
 var expected = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{authUser}:{authPass}"));
 
+var bootId = Guid.NewGuid().ToString("N");
+
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
@@ -74,7 +76,15 @@ app.UseWebSockets(new WebSocketOptions
 });
 
 app.UseDefaultFiles();
-app.UseStaticFiles();
+app.UseStaticFiles(new StaticFileOptions
+{
+    OnPrepareResponse = ctx =>
+    {
+        ctx.Context.Response.Headers["Cache-Control"] = "no-cache, no-store, must-revalidate";
+        ctx.Context.Response.Headers["Pragma"] = "no-cache";
+        ctx.Context.Response.Headers["Expires"] = "0";
+    }
+});
 
 var sessions = new ConcurrentDictionary<string, Session>();
 var sseClients = new ConcurrentDictionary<string, Channel<string>>();
@@ -120,7 +130,8 @@ app.MapGet("/api/settings", () =>
     {
         projects = current.Projects,
         buttons = current.Buttons,
-        defaultPowershellColor = current.DefaultPowershellColor
+        defaultPowershellColor = current.DefaultPowershellColor,
+        bootId
     });
 });
 
@@ -204,6 +215,40 @@ app.MapPost("/api/startup", async (HttpContext ctx) =>
         if (File.Exists(shortcutPath)) File.Delete(shortcutPath);
     }
     return Results.Json(new { enabled = File.Exists(shortcutPath) });
+});
+
+app.MapPost("/api/restart", () =>
+{
+    var baseDir = AppContext.BaseDirectory;
+    string? projectDir = null;
+    var dir = new DirectoryInfo(baseDir);
+    while (dir != null)
+    {
+        if (dir.GetFiles("*.csproj").Length > 0) { projectDir = dir.FullName; break; }
+        dir = dir.Parent;
+    }
+    if (projectDir == null)
+        return Results.Problem("Cannot find project directory");
+
+    var pid = Environment.ProcessId;
+    var escaped = projectDir.Replace("'", "''");
+    var script = $"while(Get-Process -Id {pid} -EA SilentlyContinue){{Start-Sleep -Milliseconds 500}}; Set-Location '{escaped}'; dotnet build; if($LASTEXITCODE -eq 0){{ dotnet run }}";
+    Process.Start(new ProcessStartInfo
+    {
+        FileName = "powershell.exe",
+        Arguments = $"-NoProfile -Command \"{script}\"",
+        UseShellExecute = true,
+        WindowStyle = ProcessWindowStyle.Minimized
+    });
+
+    Log("RESTART requested — spawned replacement, exiting");
+    _ = Task.Run(async () =>
+    {
+        await Task.Delay(500);
+        Environment.Exit(0);
+    });
+
+    return Results.Ok(new { restarting = true });
 });
 
 app.MapGet("/api/sessions", () =>
@@ -364,6 +409,9 @@ app.MapPost("/mcp", async (HttpContext ctx) =>
                     }),
                 McpToolDef("list_tabs",
                     "List all active terminal sessions.",
+                    new { type = "object", properties = new Dictionary<string, object>() }),
+                McpToolDef("restart",
+                    "Rebuild and restart the WebTerm server. Kills all sessions.",
                     new { type = "object", properties = new Dictionary<string, object>() })
             }
         }),
@@ -402,6 +450,7 @@ object McpHandleToolCall(JsonElement req, JsonElement? id)
         "open_tab" => McpOpenTab(id, args),
         "close_tab" => McpCloseTab(id, args),
         "list_tabs" => McpListTabs(id),
+        "restart" => McpRestart(id),
         _ => McpError(id, -32602, $"Unknown tool: {toolName}")
     };
 }
@@ -475,6 +524,43 @@ object McpListTabs(JsonElement? id)
     return McpResult(id, new
     {
         content = new[] { new { type = "text", text = JsonSerializer.Serialize(tabList) } }
+    });
+}
+
+object McpRestart(JsonElement? id)
+{
+    var baseDir = AppContext.BaseDirectory;
+    string? projectDir = null;
+    var dir = new DirectoryInfo(baseDir);
+    while (dir != null)
+    {
+        if (dir.GetFiles("*.csproj").Length > 0) { projectDir = dir.FullName; break; }
+        dir = dir.Parent;
+    }
+    if (projectDir == null)
+        return McpError(id, -32603, "Cannot find project directory");
+
+    var pid = Environment.ProcessId;
+    var escaped = projectDir.Replace("'", "''");
+    var script = $"while(Get-Process -Id {pid} -EA SilentlyContinue){{Start-Sleep -Milliseconds 500}}; Set-Location '{escaped}'; dotnet build; if($LASTEXITCODE -eq 0){{ dotnet run }}";
+    Process.Start(new ProcessStartInfo
+    {
+        FileName = "powershell.exe",
+        Arguments = $"-NoProfile -Command \"{script}\"",
+        UseShellExecute = true,
+        WindowStyle = ProcessWindowStyle.Minimized
+    });
+
+    Log("RESTART requested via MCP — spawned replacement, exiting");
+    _ = Task.Run(async () =>
+    {
+        await Task.Delay(500);
+        Environment.Exit(0);
+    });
+
+    return McpResult(id, new
+    {
+        content = new[] { new { type = "text", text = "WebTerm restarting…" } }
     });
 }
 
@@ -600,12 +686,10 @@ sealed class Session : IDisposable
         string cwd;
         string[] cmd;
 
-        var rmPsrl = "Remove-Module PSReadLine -ErrorAction SilentlyContinue;";
-
         if (kind == "powershell")
         {
             cwd = home;
-            cmd = ["-NoExit", "-Command", rmPsrl];
+            cmd = ["-NoProfile", "-NoLogo", "-NoExit"];
         }
         else
         {
@@ -613,7 +697,7 @@ sealed class Session : IDisposable
             var project = current.Projects.FirstOrDefault(p => p.Id == projectId);
             cwd = project?.Directory ?? home;
             var claudeCmd = kind == "claude-resume" ? "claude --resume" : "claude";
-            cmd = ["-NoExit", "-Command", $"{rmPsrl} {claudeCmd}"];
+            cmd = ["-NoProfile", "-NoLogo", "-NoExit", "-Command", claudeCmd];
         }
 
         log($"SESSION LAUNCH sid={sidShort}… kind={kind} cwd={cwd}");
@@ -867,7 +951,7 @@ class ProjectSettings
 class ButtonConfig
 {
     [JsonPropertyName("order")]
-    public List<string> Order { get; set; } = ["enter", "up", "down", "left", "right", "ctrl-c", "esc", "tab", "shift-tab", "ctrl-b", "ctrl-o", "clr", "cmpt", "model", "effort"];
+    public List<string> Order { get; set; } = ["enter", "tab", "up", "down", "left", "right", "ctrl-c", "esc", "shift-tab", "ctrl-b", "ctrl-o", "clr", "cmpt", "model", "effort"];
 
     [JsonPropertyName("custom")]
     public List<CustomButton> Custom { get; set; } = [];

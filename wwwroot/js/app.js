@@ -76,11 +76,7 @@
 
   // Load settings and initialize
   const settings = await Settings.load();
-  if(settings.buttons){
-    ButtonBar.setConfig(settings.buttons.order, settings.buttons.custom);
-  } else {
-    ButtonBar.render();
-  }
+  ButtonBar.setConfig(settings.buttons.order, settings.buttons.custom);
 
   // Restore tabs from server session registry
   try {

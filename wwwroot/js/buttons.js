@@ -1,13 +1,13 @@
 window.ButtonBar = (function(){
   const BUILTIN_BUTTONS = {
     'enter':       { label:'ENT',    fn:()=>{ sendActive('\r'); resetTa(); } },
+    'tab':         { label:'Tab',    fn:()=>{ sendActive('\t'); resetTa(); } },
     'up':          { label:'&#8593;', fn:()=>{ sendActive('\x1b[A'); resetTa(); } },
     'down':        { label:'&#8595;', fn:()=>{ sendActive('\x1b[B'); resetTa(); } },
     'left':        { label:'&#8592;', fn:()=>{ sendActive('\x1b[D'); resetTa(); } },
     'right':       { label:'&#8594;', fn:()=>{ sendActive('\x1b[C'); resetTa(); } },
     'ctrl-c':      { label:'^C',     fn:()=>{ sendActive('\x03'); resetTa(); } },
     'esc':         { label:'Esc',    fn:()=>{ sendActive('\x1b'); resetTa(); } },
-    'tab':         { label:'Tab',    fn:()=>{ sendActive('\t'); resetTa(); } },
     'shift-tab':   { label:'S-Tab',  fn:()=>{ sendActive('\x1b[Z'); resetTa(); } },
     'ctrl-b':      { label:'^B',     fn:()=>{ sendActive('\x02'); resetTa(); } },
     'ctrl-o':      { label:'^O',     fn:()=>{ sendActive('\x0f'); resetTa(); } },
@@ -60,7 +60,7 @@ window.ButtonBar = (function(){
   }
 
   function getExpandedButtons(){
-    const order = buttonOrder || Object.keys(BUILTIN_BUTTONS);
+    const order = buttonOrder;
     const btns = [];
     for(const key of order){
       const b = BUILTIN_BUTTONS[key];
@@ -152,16 +152,29 @@ window.ButtonBar = (function(){
   });
 
   function setConfig(order, custom){
+    if(order){
+      const missing = Object.keys(BUILTIN_BUTTONS).filter(k => !BUILTIN_BUTTONS[k].minimizedOnly && !order.includes(k));
+      for(const key of missing){
+        const keys = Object.keys(BUILTIN_BUTTONS).filter(k => !BUILTIN_BUTTONS[k].minimizedOnly);
+        const idealIdx = keys.indexOf(key);
+        let insertAt = order.length;
+        for(let i = idealIdx - 1; i >= 0; i--){
+          const prev = keys[i];
+          const prevIdx = order.indexOf(prev);
+          if(prevIdx !== -1){ insertAt = prevIdx + 1; break; }
+        }
+        order.splice(insertAt, 0, key);
+      }
+    }
     buttonOrder = order;
     customButtons = custom || [];
     render();
   }
 
-  function getBuiltinKeys(){ return Object.keys(BUILTIN_BUTTONS); }
   function getConfigurableKeys(){ return Object.keys(BUILTIN_BUTTONS).filter(k => !BUILTIN_BUTTONS[k].minimizedOnly); }
   function getBuiltinLabel(key){ return BUILTIN_BUTTONS[key]?.label || key; }
   function isBuiltin(key){ return !!BUILTIN_BUTTONS[key]; }
   function isMinimizedOnly(key){ return !!BUILTIN_BUTTONS[key]?.minimizedOnly; }
 
-  return { render, setConfig, getBuiltinKeys, getConfigurableKeys, getBuiltinLabel, isBuiltin, isMinimizedOnly, sendActive, resetTa, expanded: () => expanded };
+  return { render, setConfig, getConfigurableKeys, getBuiltinLabel, isBuiltin, isMinimizedOnly, sendActive, resetTa, expanded: () => expanded };
 })();
