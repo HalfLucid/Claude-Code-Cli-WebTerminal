@@ -12,6 +12,9 @@ ASP.NET Core minimal API backend + xterm.js frontend. Connects your browser to a
 - **Mobile-friendly** — touch-optimized button overlay with configurable keys (Enter, arrows, Ctrl combos, Esc, Tab, etc.) and paginated layout.
 - **Native text input** — uses a virtual text entry layer that preserves your device's autocomplete, swipe typing, dictation, and IME support. Edits are transparently bridged to the PTY, so the full mobile keyboard experience works naturally in the terminal.
 - **Session ring buffer** — 256KB buffer replays recent output on reconnect so you never lose context.
+- **Server-sourced session registry** — tab state lives on the server, not in localStorage. Any browser connecting sees all active sessions. Cross-device by default.
+- **Real-time tab sync via SSE** — Server-Sent Events push `tab_opened` / `tab_closed` notifications to all connected browsers instantly (MCP-created tabs, cross-device opens, idle reaps).
+- **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) endpoint at `/mcp`. Tools: `open_tab`, `close_tab`, `list_tabs`. Lets Claude Code (or any MCP client) open and manage terminal tabs programmatically. One-click setup from the main screen.
 - **Basic auth** — credentials set on first run, encrypted with Windows DPAPI.
 - **Startup toggle** — optional Windows startup registration from the main screen.
 - **Configurable buttons** — reorder built-in buttons, switch Claude model/effort, and create custom buttons that send any text to the terminal. Custom buttons can trigger slash commands (e.g. `/review`), full prompts (e.g. `summarize all changes, commit, and create a pull request`), or any terminal input.
@@ -89,6 +92,26 @@ Custom button commands are sent directly to the terminal as text input, so they 
 | Status | `git status` | Runs a git command in a PowerShell tab |
 
 Buttons and their order are persisted in `webterm-settings.json` and shared across all sessions.
+
+## MCP Integration
+
+WebTerm includes a built-in [MCP](https://modelcontextprotocol.io/) server that lets Claude Code open, close, and list terminal tabs programmatically.
+
+**Setup:**
+
+1. Click the **MCP** button on the main screen
+2. A PowerShell tab opens with the `claude mcp add` command pre-filled — press Enter to register it
+3. Claude Code can now manage your WebTerm tabs via MCP tools
+
+**Available tools:**
+
+| Tool | Description |
+|------|-------------|
+| `open_tab` | Open a new terminal tab (PowerShell, Claude, or Claude resume). Optionally specify a project, label, or command to run on launch. |
+| `close_tab` | Close a tab by session ID |
+| `list_tabs` | List all active sessions with metadata |
+
+Auth uses a DPAPI-encrypted API key (separate from Basic auth), passed via `?token=` query parameter.
 
 ## Publishing
 
