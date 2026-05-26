@@ -13,7 +13,8 @@ window.TerminalManager = (function(){
       cursorBlink: true,
       allowProposedApi: true,
       disableStdin: true,
-      scrollback: 5000
+      scrollback: 5000,
+      smoothScrollDuration: 120
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);

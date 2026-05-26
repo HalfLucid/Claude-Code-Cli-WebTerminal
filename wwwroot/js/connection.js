@@ -20,6 +20,11 @@ window.Connection = (function(){
       if(typeof e.data === 'string'){
         try{
           const m = JSON.parse(e.data);
+          if(m.ptyExited){
+            disconnect(tab);
+            TabManager.removeStaleTab(tab);
+            return;
+          }
           if(m.choose){
             if(tab.restored){
               disconnect(tab);
@@ -34,7 +39,10 @@ window.Connection = (function(){
         return;
       }
       if(tab.restored) tab.restored = false;
-      tab.term.write(new Uint8Array(e.data), () => tab.term.scrollToBottom());
+      tab.reconnectFails = 0;
+      const buf = tab.term.buffer.active;
+      const wasNearBottom = (buf.baseY - buf.viewportY) <= 3;
+      tab.term.write(new Uint8Array(e.data), () => { if(wasNearBottom) tab.term.scrollToBottom(); });
     };
 
     tab.ws.onclose = () => { scheduleReconnect(tab); };
@@ -43,6 +51,15 @@ window.Connection = (function(){
 
   function scheduleReconnect(tab){
     if(tab.reconnectTimer) return;
+    tab.reconnectFails = (tab.reconnectFails || 0) + 1;
+    if(tab.reconnectFails >= 5){
+      fetch('/api/sessions').then(r => r.json()).then(list => {
+        if(!list.find(s => s.sid === tab.sid)){
+          disconnect(tab);
+          TabManager.removeStaleTab(tab);
+        }
+      }).catch(() => {});
+    }
     if(TabManager.getActive() === tab) setBanner('Disconnected — reconnecting…');
     tab.reconnectTimer = setTimeout(() => {
       tab.reconnectTimer = null;

@@ -67,7 +67,11 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
-app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
+app.UseWebSockets(new WebSocketOptions
+{
+    KeepAliveInterval = TimeSpan.FromSeconds(20),
+    KeepAliveTimeout = TimeSpan.FromSeconds(30)
+});
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
@@ -97,9 +101,11 @@ _ = Task.Run(async () =>
         var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(30);
         foreach (var kv in sessions)
         {
-            if (kv.Value.IsIdleSince(cutoff) && sessions.TryRemove(kv.Key, out var s))
+            var shouldReap = kv.Value.IsIdleSince(cutoff) || kv.Value.PtyExited;
+            if (shouldReap && sessions.TryRemove(kv.Key, out var s))
             {
-                Log($"SESSION REAPED sid={kv.Key[..8]}… (idle 30m, {s.Stats})");
+                var reason = s.PtyExited ? "pty exited" : "idle 30m";
+                Log($"SESSION REAPED sid={kv.Key[..8]}… ({reason}, {s.Stats})");
                 s.Dispose();
                 BroadcastSse("tab_closed", new { sid = kv.Key });
             }
@@ -542,6 +548,7 @@ sealed class Session : IDisposable
     Channel<byte[]>? _channel;
     DateTime _lastDetached = DateTime.UtcNow;
     bool _disposed;
+    bool _ptyExited;
     int _cols = 120, _rows = 30;
     bool _launched;
     readonly DateTime _createdAt = DateTime.Now;
@@ -576,6 +583,7 @@ sealed class Session : IDisposable
     public string? Color { get { lock (_lock) return _color; } }
     public string? ProjectId { get { lock (_lock) return _projectId; } }
     public bool HasWebSocket { get { lock (_lock) return _current != null; } }
+    public bool PtyExited { get { lock (_lock) return _ptyExited; } }
 
     public void Launch(string kind, string? projectId, SettingsManager sm, string sidShort, Action<string> log, string? defaultCommand = null)
     {
@@ -665,6 +673,19 @@ sealed class Session : IDisposable
             }
         }
         catch { }
+
+        WebSocket? ws;
+        lock (_lock)
+        {
+            _ptyExited = true;
+            ws = _current;
+        }
+        if (ws != null)
+        {
+            var exitMsg = Encoding.UTF8.GetBytes("{\"ptyExited\":true}");
+            try { await ws.SendAsync(exitMsg, WebSocketMessageType.Text, true, default); } catch { }
+            try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "pty-exited", default); } catch { }
+        }
     }
 
     public async Task Attach(WebSocket ws, SettingsManager sm, string sidShort, string ip, Action<string> log)
@@ -686,7 +707,8 @@ sealed class Session : IDisposable
         if (old != null)
         {
             log($"WS REPLACED sid={sidShort}… old connection closed");
-            try { await old.CloseAsync(WebSocketCloseStatus.NormalClosure, "replaced", default); } catch { }
+            using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            try { await old.CloseAsync(WebSocketCloseStatus.NormalClosure, "replaced", closeCts.Token); } catch { }
         }
 
         try
@@ -696,6 +718,11 @@ sealed class Session : IDisposable
             if (!IsLaunched)
             {
                 var msg = Encoding.UTF8.GetBytes("{\"choose\":true}");
+                await ws.SendAsync(msg, WebSocketMessageType.Text, true, default);
+            }
+            else if (PtyExited)
+            {
+                var msg = Encoding.UTF8.GetBytes("{\"ptyExited\":true}");
                 await ws.SendAsync(msg, WebSocketMessageType.Text, true, default);
             }
         }
