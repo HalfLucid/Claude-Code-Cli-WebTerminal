@@ -32,13 +32,17 @@
     const k = e.key;
     if(k === 'Backspace'){ e.preventDefault(); sendActive('\x7f'); if(sentLen > 0) sentLen--; ta.value = ta.value.slice(0, -1); return; }
     if(k === 'Enter'){ e.preventDefault(); sendActive('\r'); resetTa(); return; }
-    if(k === 'Tab'){ e.preventDefault(); sendActive('\t'); resetTa(); return; }
-    if(k === 'ArrowUp'){ e.preventDefault(); sendActive('\x1b[A'); resetTa(); return; }
-    if(k === 'ArrowDown'){ e.preventDefault(); sendActive('\x1b[B'); resetTa(); return; }
-    if(k === 'ArrowRight'){ e.preventDefault(); sendActive('\x1b[C'); resetTa(); return; }
-    if(k === 'ArrowLeft'){ e.preventDefault(); sendActive('\x1b[D'); resetTa(); return; }
-    if(k === 'Home'){ e.preventDefault(); sendActive('\x1b[H'); resetTa(); return; }
-    if(k === 'End'){ e.preventDefault(); sendActive('\x1b[F'); resetTa(); return; }
+    if(k === 'Tab'){ e.preventDefault(); sendActive(e.shiftKey ? '\x1b[Z' : '\t'); resetTa(); return; }
+    if(k === 'Delete'){ e.preventDefault(); sendActive('\x1b[3~'); resetTa(); return; }
+    if(k === 'PageUp'){ e.preventDefault(); sendActive('\x1b[5~'); resetTa(); return; }
+    if(k === 'PageDown'){ e.preventDefault(); sendActive('\x1b[6~'); resetTa(); return; }
+    if(k === 'Insert'){ e.preventDefault(); sendActive('\x1b[2~'); resetTa(); return; }
+    if(k === 'ArrowUp'){ e.preventDefault(); sendActive(e.ctrlKey ? '\x1b[1;5A' : e.shiftKey ? '\x1b[1;2A' : '\x1b[A'); resetTa(); return; }
+    if(k === 'ArrowDown'){ e.preventDefault(); sendActive(e.ctrlKey ? '\x1b[1;5B' : e.shiftKey ? '\x1b[1;2B' : '\x1b[B'); resetTa(); return; }
+    if(k === 'ArrowRight'){ e.preventDefault(); sendActive(e.ctrlKey ? '\x1b[1;5C' : e.shiftKey ? '\x1b[1;2C' : '\x1b[C'); resetTa(); return; }
+    if(k === 'ArrowLeft'){ e.preventDefault(); sendActive(e.ctrlKey ? '\x1b[1;5D' : e.shiftKey ? '\x1b[1;2D' : '\x1b[D'); resetTa(); return; }
+    if(k === 'Home'){ e.preventDefault(); sendActive(e.ctrlKey ? '\x1b[1;5H' : e.shiftKey ? '\x1b[1;2H' : '\x1b[H'); resetTa(); return; }
+    if(k === 'End'){ e.preventDefault(); sendActive(e.ctrlKey ? '\x1b[1;5F' : e.shiftKey ? '\x1b[1;2F' : '\x1b[F'); resetTa(); return; }
     if(k === 'Escape'){ e.preventDefault(); sendActive('\x1b'); resetTa(); return; }
     if(e.ctrlKey && k.length === 1){
       const c = k.toLowerCase().charCodeAt(0);
