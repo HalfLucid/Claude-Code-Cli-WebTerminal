@@ -60,21 +60,31 @@ window.TabManager = (function(){
 
   function switchTo(index){
     if(index < 0 || index >= tabs.length) return;
-    if(activeIndex >= 0 && activeIndex < tabs.length){
-      tabs[activeIndex].containerEl.classList.remove('active');
+    const prevTab = (activeIndex >= 0 && activeIndex < tabs.length) ? tabs[activeIndex] : null;
+    if(prevTab){
+      prevTab.containerEl.classList.remove('active');
     }
     activeIndex = index;
     const tab = tabs[activeIndex];
+    tab.attention = null;
     tab.containerEl.classList.add('active');
 
     document.body.classList.toggle('has-tabs', tabs.length > 0);
     hideMainScreen();
     renderTabBar();
 
+    var ta = document.getElementById('ta');
+    if(prevTab){
+      prevTab.savedInput = ta.value;
+      prevTab.savedSentLen = window.sentLen;
+    }
+    ta.value = tab.savedInput || '';
+    window.sentLen = tab.savedSentLen || 0;
+
     setTimeout(() => {
       try{ tab.fitAddon.fit(); }catch{}
       Connection.sendSize(tab);
-      document.getElementById('ta').focus();
+      ta.focus();
     }, 50);
 
     saveTabs();
@@ -130,7 +140,8 @@ window.TabManager = (function(){
 
     tabs.forEach((tab, i) => {
       const el = document.createElement('div');
-      el.className = 'tab' + (i === activeIndex ? ' active' : '');
+      var attCls = tab.attention === 'permission' ? ' attention-permission' : tab.attention === 'idle' ? ' attention-idle' : '';
+      el.className = 'tab' + (i === activeIndex ? ' active' : '') + attCls;
       el.style.borderColor = tab.color;
       if(i === activeIndex){
         el.style.background = tab.color + '33';
@@ -237,11 +248,25 @@ window.TabManager = (function(){
     return tab;
   }
 
+  function setAttention(sid, type){
+    var tab = tabs.find(function(t){ return t.sid === sid; });
+    if(!tab) return;
+    tab.attention = type;
+    renderTabBar();
+  }
+
+  function clearAttention(sid){
+    var tab = tabs.find(function(t){ return t.sid === sid; });
+    if(!tab) return;
+    tab.attention = null;
+    renderTabBar();
+  }
+
   return {
     createTab, createExternalTab, restoreTab, switchTo, closeTab, removeStaleTab,
     renderTabBar, getActive, getAll,
     showMainScreen, hideMainScreen,
     loadSavedTabs, getSavedActiveIndex, migrateOldSid,
-    saveTabs
+    saveTabs, setAttention, clearAttention
   };
 })();

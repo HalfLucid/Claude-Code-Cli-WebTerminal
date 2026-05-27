@@ -4,6 +4,7 @@ using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Threading.Channels;
 using Porta.Pty;
@@ -53,7 +54,7 @@ void Log(string message) => Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:
 
 app.Use(async (ctx, next) =>
 {
-    if (ctx.Request.Path == "/mcp")
+    if (ctx.Request.Path == "/mcp" || ctx.Request.Path == "/api/notify")
     {
         await next();
         return;
@@ -310,6 +311,53 @@ app.MapGet("/api/events", async (HttpContext ctx) =>
     }
 });
 
+app.MapPost("/api/notify", async (HttpContext ctx) =>
+{
+    var token = ctx.Request.Query["token"].ToString();
+    var current = sm.Load();
+    if (string.IsNullOrEmpty(current.McpKeyProtected) || string.IsNullOrEmpty(token))
+    {
+        ctx.Response.StatusCode = 401;
+        return;
+    }
+    try
+    {
+        if (token != SettingsManager.Unprotect(current.McpKeyProtected))
+        {
+            ctx.Response.StatusCode = 401;
+            return;
+        }
+    }
+    catch
+    {
+        ctx.Response.StatusCode = 401;
+        return;
+    }
+
+    JsonElement body;
+    try { body = await ctx.Request.ReadFromJsonAsync<JsonElement>(); }
+    catch { ctx.Response.StatusCode = 400; return; }
+
+    var sid = body.TryGetProperty("sid", out var s) ? s.GetString() : null;
+    var evt = body.TryGetProperty("event", out var ev) ? ev.GetString() : null;
+    if (string.IsNullOrEmpty(sid) || string.IsNullOrEmpty(evt))
+    {
+        ctx.Response.StatusCode = 400;
+        return;
+    }
+
+    var sseEvent = evt switch
+    {
+        "permission_request" => "tab_attention",
+        "stop" => "tab_idle",
+        _ => (string?)null
+    };
+    if (sseEvent == null) { ctx.Response.StatusCode = 400; return; }
+
+    BroadcastSse(sseEvent, new { sid, @event = evt });
+    Log($"NOTIFY sid={sid[..Math.Min(8, sid.Length)]}… event={evt}");
+});
+
 app.MapPost("/api/mcp-setup", () =>
 {
     var current = sm.Load();
@@ -326,6 +374,87 @@ app.MapPost("/api/mcp-setup", () =>
         sm.Save(current);
         Log("MCP key generated and saved");
     }
+
+    var claudeDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
+    var hooksDirPath = Path.Combine(claudeDir, "hooks");
+    Directory.CreateDirectory(hooksDirPath);
+    var hookScriptPath = Path.Combine(hooksDirPath, "webterm-notify.ps1");
+    File.WriteAllText(hookScriptPath, """
+        $sid = $env:WEBTERM_SID
+        $token = $env:WEBTERM_NOTIFY_TOKEN
+        if (-not $sid -or -not $token) { exit 0 }
+        $eventType = $args[0]
+        if (-not $eventType) { exit 0 }
+        $body = "{`"sid`":`"$sid`",`"event`":`"$eventType`"}"
+        try {
+            Invoke-RestMethod -Uri "http://localhost:7681/api/notify?token=$token" -Method POST -Body $body -ContentType 'application/json' -TimeoutSec 2 2>$null | Out-Null
+        } catch {}
+        """);
+
+    try
+    {
+        var claudeSettingsPath = Path.Combine(claudeDir, "settings.json");
+        JsonObject claudeSettings;
+        if (File.Exists(claudeSettingsPath))
+            claudeSettings = JsonNode.Parse(File.ReadAllText(claudeSettingsPath))?.AsObject() ?? new JsonObject();
+        else
+            claudeSettings = new JsonObject();
+
+        var hooksObj = claudeSettings["hooks"]?.AsObject();
+        if (hooksObj == null)
+        {
+            hooksObj = new JsonObject();
+            claudeSettings["hooks"] = hooksObj;
+        }
+
+        var hookCmd = $"powershell.exe -ExecutionPolicy Bypass -File \"{hookScriptPath}\"";
+
+        void AddHookIfMissing(string eventName, string arg)
+        {
+            var fullCmd = $"{hookCmd} {arg}";
+            var arr = hooksObj[eventName]?.AsArray();
+            if (arr != null)
+            {
+                foreach (var group in arr)
+                {
+                    var inner = group?["hooks"]?.AsArray();
+                    if (inner != null)
+                        foreach (var h in inner)
+                            if (h?["command"]?.GetValue<string>()?.Contains("webterm-notify") == true)
+                                return;
+                }
+            }
+            else
+            {
+                arr = new JsonArray();
+                hooksObj[eventName] = arr;
+            }
+            arr.Add(new JsonObject
+            {
+                ["matcher"] = "*",
+                ["hooks"] = new JsonArray
+                {
+                    new JsonObject
+                    {
+                        ["type"] = "command",
+                        ["command"] = fullCmd,
+                        ["timeout"] = 10
+                    }
+                }
+            });
+        }
+
+        AddHookIfMissing("PermissionRequest", "permission_request");
+        AddHookIfMissing("Stop", "stop");
+
+        File.WriteAllText(claudeSettingsPath, claudeSettings.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        Log("Claude hooks configured for WebTerm notifications");
+    }
+    catch (Exception ex)
+    {
+        Log($"Failed to configure Claude hooks: {ex.Message}");
+    }
+
     var url = $"http://localhost:7681/mcp?token={Uri.EscapeDataString(mcpKey)}";
     var command = $"claude mcp add webterm --transport http \"{url}\" -s user";
     return Results.Json(new { command, url });
@@ -474,7 +603,7 @@ object McpOpenTab(JsonElement? id, JsonElement args)
     sessions[sid] = session;
 
     var sidShort = sid[..8];
-    session.Launch(kind, projectId, sm, sidShort, Log, command);
+    session.Launch(kind, projectId, sm, sid, sidShort, Log, command);
 
     BroadcastSse("tab_opened", new { sid, kind, label, color, projectId });
     Log($"MCP OPEN sid={sidShort}… kind={kind} label={label}");
@@ -582,7 +711,7 @@ app.Map("/ws", async ctx =>
         Log($"SESSION NEW sid={sidShort}… from {ip}");
     else
         Log($"SESSION RECONNECT sid={sidShort}… from {ip}");
-    await session.Attach(ws, sm, sidShort, ip, Log);
+    await session.Attach(ws, sm, sid, sidShort, ip, Log);
 });
 
 var listenUrl = "http://0.0.0.0:7681";
@@ -671,7 +800,7 @@ sealed class Session : IDisposable
     public bool HasWebSocket { get { lock (_lock) return _current != null; } }
     public bool PtyExited { get { lock (_lock) return _ptyExited; } }
 
-    public void Launch(string kind, string? projectId, SettingsManager sm, string sidShort, Action<string> log, string? defaultCommand = null)
+    public void Launch(string kind, string? projectId, SettingsManager sm, string sid, string sidShort, Action<string> log, string? defaultCommand = null)
     {
         lock (_lock)
         {
@@ -703,6 +832,20 @@ sealed class Session : IDisposable
 
         log($"SESSION LAUNCH sid={sidShort}… kind={kind} cwd={cwd}");
 
+        var env = new Dictionary<string, string>();
+        if (kind != "powershell")
+        {
+            foreach (System.Collections.DictionaryEntry de in System.Environment.GetEnvironmentVariables())
+                env[(string)de.Key] = de.Value?.ToString() ?? "";
+            env["WEBTERM_SID"] = sid;
+            var cs = sm.Load();
+            if (!string.IsNullOrEmpty(cs.McpKeyProtected))
+            {
+                try { env["WEBTERM_NOTIFY_TOKEN"] = SettingsManager.Unprotect(cs.McpKeyProtected); }
+                catch { }
+            }
+        }
+
         var opts = new PtyOptions
         {
             Name = "xterm-256color",
@@ -711,7 +854,7 @@ sealed class Session : IDisposable
             Cwd = cwd,
             App = app,
             CommandLine = cmd,
-            Environment = new Dictionary<string, string>()
+            Environment = env
         };
         Pty = PtyProvider.SpawnAsync(opts, CancellationToken.None).GetAwaiter().GetResult();
         _ = Task.Run(ReadLoop);
@@ -773,7 +916,7 @@ sealed class Session : IDisposable
         }
     }
 
-    public async Task Attach(WebSocket ws, SettingsManager sm, string sidShort, string ip, Action<string> log)
+    public async Task Attach(WebSocket ws, SettingsManager sm, string sid, string sidShort, string ip, Action<string> log)
     {
         WebSocket? old;
         Channel<byte[]>? oldCh;
@@ -854,7 +997,7 @@ sealed class Session : IDisposable
                             if (root.TryGetProperty("color", out var clrProp) && clrProp.ValueKind == JsonValueKind.String)
                                 colorVal = clrProp.GetString();
                             lock (_lock) { _label ??= labelVal; _color ??= colorVal; }
-                            Launch(lk.GetString()!, projId, sm, sidShort, log, defCmd);
+                            Launch(lk.GetString()!, projId, sm, sid, sidShort, log, defCmd);
                         }
                         else if (root.TryGetProperty("cols", out var c) && root.TryGetProperty("rows", out var rr))
                         {

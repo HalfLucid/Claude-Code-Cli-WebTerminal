@@ -30,6 +30,7 @@
 
   ta.addEventListener('keydown', e => {
     const k = e.key;
+    if(k === 'Backspace'){ e.preventDefault(); sendActive('\x7f'); if(sentLen > 0) sentLen--; ta.value = ta.value.slice(0, -1); return; }
     if(k === 'Enter'){ e.preventDefault(); sendActive('\r'); resetTa(); return; }
     if(k === 'Tab'){ e.preventDefault(); sendActive('\t'); resetTa(); return; }
     if(k === 'ArrowUp'){ e.preventDefault(); sendActive('\x1b[A'); resetTa(); return; }
@@ -64,9 +65,33 @@
   if(window.visualViewport) window.visualViewport.addEventListener('resize', scheduleResize);
   if(window.screen && screen.orientation) screen.orientation.addEventListener('change', () => setTimeout(scheduleResize, 300));
 
+  // Notification permission
+  if('Notification' in window && Notification.permission === 'default'){
+    Notification.requestPermission();
+  }
+
+  // Title flash
+  var titleFlashTimer = null;
+  function startTitleFlash(msg){
+    if(titleFlashTimer) clearInterval(titleFlashTimer);
+    var flip = false;
+    titleFlashTimer = setInterval(function(){
+      document.title = flip ? 'WebTerm' : msg;
+      flip = !flip;
+    }, 1000);
+  }
+  function stopTitleFlash(){
+    if(titleFlashTimer){
+      clearInterval(titleFlashTimer);
+      titleFlashTimer = null;
+      document.title = 'WebTerm';
+    }
+  }
+
   // Visibility + online reconnect
   document.addEventListener('visibilitychange', () => {
     if(document.visibilityState === 'visible'){
+      stopTitleFlash();
       TabManager.getAll().forEach(tab => Connection.reconnectIfNeeded(tab));
     }
   });
@@ -105,6 +130,36 @@
       var data = JSON.parse(e.data);
       var tab = TabManager.getAll().find(function(t){ return t.sid === data.sid; });
       if(tab) TabManager.removeStaleTab(tab);
+    });
+    es.addEventListener('tab_attention', function(e){
+      var data = JSON.parse(e.data);
+      TabManager.setAttention(data.sid, 'permission');
+      var tab = TabManager.getAll().find(function(t){ return t.sid === data.sid; });
+      var isActiveVisible = tab && TabManager.getActive() === tab && document.visibilityState === 'visible';
+      if(!isActiveVisible){
+        startTitleFlash('⚠ Approval needed');
+        if('Notification' in window && Notification.permission === 'granted'){
+          new Notification('Claude needs approval', {
+            body: 'Tab: ' + (tab ? tab.label : 'Unknown'),
+            tag: 'webterm-attention-' + data.sid
+          });
+        }
+      }
+    });
+    es.addEventListener('tab_idle', function(e){
+      var data = JSON.parse(e.data);
+      TabManager.setAttention(data.sid, 'idle');
+      var tab = TabManager.getAll().find(function(t){ return t.sid === data.sid; });
+      var isActiveVisible = tab && TabManager.getActive() === tab && document.visibilityState === 'visible';
+      if(!isActiveVisible){
+        startTitleFlash('✓ Claude finished');
+        if('Notification' in window && Notification.permission === 'granted'){
+          new Notification('Claude finished', {
+            body: 'Tab: ' + (tab ? tab.label : 'Unknown'),
+            tag: 'webterm-idle-' + data.sid
+          });
+        }
+      }
     });
   })();
 

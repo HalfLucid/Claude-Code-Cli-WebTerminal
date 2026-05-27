@@ -13,6 +13,10 @@ body.has-tabs #tab-bar{display:flex}
 .tab-close{background:none;border:none;color:#8b949e;font:14px monospace;cursor:pointer;padding:0 2px;line-height:1;display:none}
 .tab.active .tab-close{display:inline}
 .tab-close:hover{color:#f85149}
+.tab.attention-permission{animation:tab-pulse 1.5s ease-in-out infinite}
+.tab.attention-idle .tab-label::before{content:'✓ ';color:#3fb950}
+.tab.attention-permission .tab-label::before{content:'● ';color:#f0a020}
+@keyframes tab-pulse{0%,100%{background:transparent}50%{background:rgba(240,160,32,0.2)}}
 .tab-new-btn{background:#0d1117;color:#58a6ff;border:none;border-left:1px solid #21262d;padding:0 12px;font:18px monospace;cursor:pointer;flex-shrink:0}
 
 /* Terminal containers */
