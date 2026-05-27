@@ -698,8 +698,7 @@ sealed class Session : IDisposable
             var current = sm.Load();
             var project = current.Projects.FirstOrDefault(p => p.Id == projectId);
             cwd = project?.Directory ?? home;
-            var claudeCmd = kind == "claude-resume" ? "claude --resume" : "claude";
-            cmd = ["/K", claudeCmd];
+            cmd = kind == "claude-resume" ? ["/K", "claude", "--resume"] : ["/K", "claude"];
         }
 
         log($"SESSION LAUNCH sid={sidShort}… kind={kind} cwd={cwd}");

@@ -41,7 +41,7 @@ window.Connection = (function(){
       if(tab.restored) tab.restored = false;
       tab.reconnectFails = 0;
       const buf = tab.term.buffer.active;
-      const wasNearBottom = (buf.baseY - buf.viewportY) <= 3;
+      const wasNearBottom = (buf.baseY - buf.viewportY) <= 1;
       tab.term.write(new Uint8Array(e.data), () => { if(wasNearBottom) tab.term.scrollToBottom(); });
     };
 
