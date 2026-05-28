@@ -14,6 +14,7 @@ ASP.NET Core minimal API backend + xterm.js frontend. Connects your browser to a
 - **Session ring buffer** — 256KB buffer replays recent output on reconnect so you never lose context.
 - **Server-sourced session registry** — tab state lives on the server, not in localStorage. Any browser connecting sees all active sessions. Cross-device by default.
 - **Real-time tab sync via SSE** — Server-Sent Events push `tab_opened` / `tab_closed` notifications to all connected browsers instantly (MCP-created tabs, cross-device opens, idle reaps).
+- **Tab attention notifications** — Claude Code hooks notify WebTerm when Claude needs approval or finishes. Tab bar shows attention indicators, the page title flashes, and browser push notifications fire when you're not looking. Auto-configured during MCP setup.
 - **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) endpoint at `/mcp`. Tools: `open_tab`, `close_tab`, `list_tabs`. Lets Claude Code (or any MCP client) open and manage terminal tabs programmatically. One-click setup from the main screen.
 - **Basic auth** — credentials set on first run, encrypted with Windows DPAPI.
 - **Startup toggle** — optional Windows startup registration from the main screen.
@@ -102,6 +103,8 @@ WebTerm includes a built-in [MCP](https://modelcontextprotocol.io/) server that 
 1. Click the **MCP** button on the main screen
 2. A PowerShell tab opens with the `claude mcp add` command pre-filled — press Enter to register it
 3. Claude Code can now manage your WebTerm tabs via MCP tools
+
+MCP setup also installs Claude Code hooks that send tab attention notifications (permission requests, task completion) back to the browser.
 
 **Available tools:**
 
