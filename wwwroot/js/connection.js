@@ -53,7 +53,11 @@ window.Connection = (function(){
     if(tab.reconnectTimer) return;
     tab.reconnectFails = (tab.reconnectFails || 0) + 1;
     if(tab.reconnectFails >= 5){
-      fetch('/api/sessions').then(r => r.json()).then(list => {
+      fetch('/api/sessions').then(r => {
+        if(r.status === 401){ location.reload(); return null; }
+        return r.json();
+      }).then(list => {
+        if(!list) return;
         if(!list.find(s => s.sid === tab.sid)){
           disconnect(tab);
           TabManager.removeStaleTab(tab);
