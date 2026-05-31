@@ -24,7 +24,8 @@ window.TabManager = (function(){
       term, fitAddon, containerEl,
       ws: null,
       reconnectDelay: 500,
-      reconnectTimer: null
+      reconnectTimer: null,
+      bornAt: Date.now()   // grace window: server registers session only once WS connects
     };
 
     tabs.push(tab);

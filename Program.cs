@@ -40,6 +40,8 @@ var expected = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{authU
 
 var bootId = Guid.NewGuid().ToString("N");
 
+var authedIps = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
+
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
@@ -67,6 +69,9 @@ app.Use(async (ctx, next) =>
         ctx.Response.StatusCode = 401;
         return;
     }
+    var okIp = GetClientIp(ctx);
+    if (authedIps.TryAdd(okIp, 0))
+        Log($"AUTH OK from {okIp}");
     await next();
 });
 

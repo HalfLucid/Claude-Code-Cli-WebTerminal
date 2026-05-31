@@ -96,10 +96,12 @@
   document.addEventListener('visibilitychange', () => {
     if(document.visibilityState === 'visible'){
       stopTitleFlash();
+      reconcileSessions();
       TabManager.getAll().forEach(tab => Connection.reconnectIfNeeded(tab));
     }
   });
   window.addEventListener('online', () => {
+    reconcileSessions();
     TabManager.getAll().forEach(tab => Connection.reconnectIfNeeded(tab));
   });
 
@@ -107,23 +109,50 @@
   const settings = await Settings.load();
   ButtonBar.setConfig(settings.buttons.order, settings.buttons.custom);
 
-  // Restore tabs from server session registry
-  try {
-    const res = await fetch('/api/sessions');
-    const serverSessions = await res.json();
-    if(serverSessions.length > 0){
-      serverSessions.forEach(s => TabManager.createExternalTab(s.sid, s.kind, s.projectId, s.label, s.color));
-      TabManager.switchTo(0);
-    } else {
-      TabManager.showMainScreen();
-    }
-  } catch {
-    TabManager.showMainScreen();
+  // Reconcile local tabs against server session registry:
+  // remove tabs whose session no longer exists, add sessions not yet shown.
+  // Runs on startup and on every wake (visibility/online) + SSE reopen.
+  async function reconcileSessions(){
+    let serverSessions;
+    try {
+      const res = await fetch('/api/sessions');
+      if(!res.ok) return;            // transient — keep current tabs
+      serverSessions = await res.json();
+    } catch { return; }              // network blip — keep current tabs
+
+    const serverSids = new Set(serverSessions.map(s => s.sid));
+
+    // Drop local tabs the server no longer has (capture refs first — indices shift).
+    // Skip tabs born <8s ago: their session registers only once the WS connects,
+    // so a freshly-created local tab may legitimately not be in /api/sessions yet.
+    const now = Date.now();
+    TabManager.getAll()
+      .filter(t => !serverSids.has(t.sid) && !(t.bornAt && now - t.bornAt < 8000))
+      .forEach(t => TabManager.removeStaleTab(t));
+
+    // Add server sessions missing locally.
+    const localSids = new Set(TabManager.getAll().map(t => t.sid));
+    serverSessions.forEach(s => {
+      if(!localSids.has(s.sid))
+        TabManager.createExternalTab(s.sid, s.kind, s.projectId, s.label, s.color);
+    });
+
+    if(TabManager.getAll().length === 0) TabManager.showMainScreen();
+    else if(!TabManager.getActive()) TabManager.switchTo(0);
+    else TabManager.renderTabBar();
   }
+
+  await reconcileSessions();
+  if(TabManager.getAll().length === 0) TabManager.showMainScreen();
 
   // SSE: listen for server-pushed tab events (MCP, cross-device)
   (function initSSE(){
     var es = new EventSource('/api/events');
+    var sawError = false;
+    // EventSource auto-reconnects but events fired while it was down are lost.
+    // On every reopen after an error, re-sync the full tab list.
+    es.addEventListener('error', function(){ sawError = true; });
+    es.addEventListener('open', function(){ if(sawError){ sawError = false; reconcileSessions(); } });
     es.addEventListener('tab_opened', function(e){
       var data = JSON.parse(e.data);
       if(TabManager.getAll().find(function(t){ return t.sid === data.sid; })) return;
