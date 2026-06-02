@@ -110,12 +110,12 @@ window.MainScreen = (function(){
       const color = (settings && settings.defaultPowershellColor) || '#1e6f1e';
       launchSession('powershell', null, 'Add MCP', color, data.command);
     } catch(e) {
-      alert('MCP setup failed: ' + e.message);
+      await Dialog.alert('MCP setup failed: ' + e.message);
     }
   });
 
   document.getElementById('btn-restart').addEventListener('click', async () => {
-    if(!confirm('Restart WebTerm server? All sessions will be killed.')) return;
+    if(!await Dialog.confirm('Restart WebTerm server? All sessions will be killed.')) return;
     try {
       await fetch('/api/restart', { method: 'POST' });
     } catch {}
@@ -166,7 +166,7 @@ window.MainScreen = (function(){
   }
 
   async function deleteProject(id, name){
-    if(!confirm('Delete project "' + name + '"?')) return;
+    if(!await Dialog.confirm('Delete project "' + name + '"?')) return;
     await Settings.deleteProject(id);
     refresh();
   }

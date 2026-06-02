@@ -91,6 +91,7 @@ body.has-tabs #banner{top:37px}
 .modal-card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;max-width:420px;width:100%;box-sizing:border-box}
 .modal-card h3{color:#c9d1d9;font:600 18px monospace;margin:0 0 16px}
 .modal-card label{display:block;color:#8b949e;font:13px monospace;margin-bottom:12px}
+.dialog-message{color:#c9d1d9;font:14px monospace;line-height:1.5;margin:0;word-break:break-word}
 .modal-card input[type="text"],.modal-card input[type="color"]{display:block;width:100%;margin-top:4px;padding:8px 10px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;font:14px monospace;box-sizing:border-box}
 .modal-card input[type="color"]{height:40px;padding:4px;cursor:pointer}
 .modal-actions{display:flex;gap:8px;margin-top:18px}

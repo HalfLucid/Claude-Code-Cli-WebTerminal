@@ -92,9 +92,9 @@ window.TabManager = (function(){
     saveTabs();
   }
 
-  function closeTab(index){
+  async function closeTab(index){
     if(index < 0 || index >= tabs.length) return;
-    if(!confirm('Close "' + tabs[index].label + '" session?')) return;
+    if(!await Dialog.confirm('Close "' + tabs[index].label + '" session?')) return;
 
     const tab = tabs[index];
     fetch('/api/sessions/' + encodeURIComponent(tab.sid), { method: 'DELETE' }).catch(() => {});
