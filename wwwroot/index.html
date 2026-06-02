@@ -8,6 +8,16 @@
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 </head><body>
 <div id="banner"></div>
+<div id="takeover-overlay">
+  <div class="takeover-box">
+    <div class="takeover-title">Session taken over</div>
+    <div class="takeover-msg">This session was opened on another device or tab.</div>
+    <div class="takeover-actions">
+      <button id="takeover-reconnect">Reconnect here</button>
+      <button id="takeover-menu">Back to menu</button>
+    </div>
+  </div>
+</div>
 <div id="tab-bar">
   <button class="tab-scroll-btn" id="tab-scroll-left">&#9664;</button>
   <div id="tab-list"></div>
@@ -17,6 +27,7 @@
 <div id="terminals"></div>
 <textarea id="ta" autocapitalize="off" autocomplete="off" autocorrect="on" spellcheck="true"></textarea>
 <div class="btnbar">
+  <div class="btn nav" id="kbtoggle" role="button" title="Toggle text entry / keyboard">&#9000;</div>
   <div class="btn nav" id="btoggle" role="button">&#8595;</div>
   <div id="blist"></div>
 </div>

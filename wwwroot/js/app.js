@@ -5,6 +5,22 @@
   let sentLen = 0;
   let composing = false;
 
+  // Keyboard (text entry) toggle. When off, taps never refocus #ta, so the
+  // on-screen keyboard stays dismissed and you can thumb-scroll the full screen.
+  window.inputEnabled = true;
+  const kbtoggle = document.getElementById('kbtoggle');
+  function setInputEnabled(on){
+    window.inputEnabled = on;
+    document.body.classList.toggle('input-off', !on);
+    if(kbtoggle) kbtoggle.classList.toggle('off', !on);
+    if(on){ ta.focus(); } else { ta.blur(); }
+    scheduleResize();   // refit after keyboard show/hide changes viewport height
+  }
+  if(kbtoggle) kbtoggle.addEventListener('click', e => {
+    e.preventDefault(); e.stopPropagation();
+    setInputEnabled(window.inputEnabled === false);
+  });
+
   // Expose sentLen for ButtonBar.resetTa
   Object.defineProperty(window, 'sentLen', {
     get(){ return sentLen; },
@@ -51,6 +67,7 @@
   });
 
   document.addEventListener('click', e => {
+    if(window.inputEnabled === false) return;   // keyboard locked off — don't refocus
     if(!e.target.closest('.btn') && !e.target.closest('.tab') && !e.target.closest('.tab-new-btn') &&
        !e.target.closest('.tab-scroll-btn') && !e.target.closest('#main-screen') &&
        !e.target.closest('.modal-overlay') && !e.target.closest('.popout')){

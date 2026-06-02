@@ -4,11 +4,13 @@ window.Connection = (function(){
 
   function connect(tab){
     if(tab.ws && (tab.ws.readyState === 0 || tab.ws.readyState === 1)) return;
+    tab.takenOver = false;
     const url = wsProto + location.host + '/ws?sid=' + encodeURIComponent(tab.sid);
-    tab.ws = new WebSocket(url);
-    tab.ws.binaryType = 'arraybuffer';
+    const sock = new WebSocket(url);
+    tab.ws = sock;
+    sock.binaryType = 'arraybuffer';
 
-    tab.ws.onopen = () => {
+    sock.onopen = () => {
       tab.reconnectDelay = 500;
       if(TabManager.getActive() === tab){
         setBanner('');
@@ -16,7 +18,7 @@ window.Connection = (function(){
       }
     };
 
-    tab.ws.onmessage = e => {
+    sock.onmessage = e => {
       if(typeof e.data === 'string'){
         try{
           const m = JSON.parse(e.data);
@@ -45,8 +47,24 @@ window.Connection = (function(){
       tab.term.write(new Uint8Array(e.data), () => { if(wasNearBottom) tab.term.scrollToBottom(); });
     };
 
-    tab.ws.onclose = () => { scheduleReconnect(tab); };
-    tab.ws.onerror = () => { try { tab.ws.close(); } catch{} };
+    sock.onclose = (ev) => {
+      if(tab.ws !== sock) return;             // superseded locally (same-device reconnect) — ignore stale socket
+      if(ev.reason === 'replaced'){           // server kicked us: another client took this sid
+        showTakeover(tab);
+        return;                               // do NOT reconnect — breaks the ping-pong
+      }
+      scheduleReconnect(tab);
+    };
+    sock.onerror = () => { try { sock.close(); } catch{} };
+  }
+
+  function showTakeover(tab){
+    tab.takenOver = true;
+    if(tab.reconnectTimer){ clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; }
+    if(TabManager.getActive() === tab){
+      currentTakeoverTab = tab;
+      document.getElementById('takeover-overlay').classList.add('show');
+    }
   }
 
   function scheduleReconnect(tab){
@@ -100,10 +118,37 @@ window.Connection = (function(){
   }
 
   function reconnectIfNeeded(tab){
+    if(tab.takenOver) return;   // user must explicitly reconnect via takeover popup
     if(!tab.ws || tab.ws.readyState > 1){
       if(tab.reconnectTimer){ clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; }
       tab.reconnectDelay = 500;
       connect(tab);
+    }
+  }
+
+  let currentTakeoverTab = null;
+  const overlay = document.getElementById('takeover-overlay');
+  function hideTakeover(){ overlay.classList.remove('show'); currentTakeoverTab = null; }
+  document.getElementById('takeover-reconnect').addEventListener('click', () => {
+    const tab = currentTakeoverTab;
+    hideTakeover();
+    if(!tab) return;
+    tab.takenOver = false;
+    tab.reconnectDelay = 500;
+    connect(tab);                 // deliberate takeover-back (one-shot, not a loop)
+  });
+  document.getElementById('takeover-menu').addEventListener('click', () => {
+    hideTakeover();
+    TabManager.showMainScreen();
+  });
+
+  // Called by TabManager on tab switch: show/hide overlay for the now-active tab.
+  function refreshTakeover(tab){
+    if(tab && tab.takenOver){
+      currentTakeoverTab = tab;
+      overlay.classList.add('show');
+    } else {
+      hideTakeover();
     }
   }
 
@@ -124,5 +169,5 @@ window.Connection = (function(){
     ta.style.height = h;
   }
 
-  return { connect, send, sendJson, sendSize, disconnect, reconnectIfNeeded, setBanner, applyViewportSize };
+  return { connect, send, sendJson, sendSize, disconnect, reconnectIfNeeded, refreshTakeover, setBanner, applyViewportSize };
 })();

@@ -23,8 +23,25 @@ window.TerminalManager = (function(){
     const coreEl = containerEl.querySelector('.xterm');
     if(coreEl){
       const refocus = () => setTimeout(() => document.getElementById('ta').focus(), 0);
-      coreEl.addEventListener('mousedown', refocus);
-      coreEl.addEventListener('touchend', refocus);
+      // Desktop: click anywhere in terminal focuses input.
+      coreEl.addEventListener('mousedown', () => { if(window.inputEnabled !== false) refocus(); });
+      // Mobile: only refocus on a genuine tap, never on a scroll/drag release.
+      // Without this, lifting your thumb after scrolling up reopens the keyboard.
+      let sx = 0, sy = 0, st = 0, moved = false;
+      coreEl.addEventListener('touchstart', e => {
+        const t = e.touches[0];
+        if(t){ sx = t.clientX; sy = t.clientY; }
+        st = Date.now(); moved = false;
+      }, { passive: true });
+      coreEl.addEventListener('touchmove', e => {
+        const t = e.touches[0];
+        if(t && (Math.abs(t.clientX - sx) > 8 || Math.abs(t.clientY - sy) > 8)) moved = true;
+      }, { passive: true });
+      coreEl.addEventListener('touchend', () => {
+        if(window.inputEnabled === false) return;   // keyboard locked off
+        if(moved || Date.now() - st > 500) return;   // was a scroll/long-press, not a tap
+        refocus();
+      });
     }
     return { term, fitAddon };
   }

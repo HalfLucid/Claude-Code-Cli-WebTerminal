@@ -73,6 +73,7 @@ window.TabManager = (function(){
     document.body.classList.toggle('has-tabs', tabs.length > 0);
     hideMainScreen();
     renderTabBar();
+    Connection.refreshTakeover(tab);
 
     var ta = document.getElementById('ta');
     if(prevTab){
