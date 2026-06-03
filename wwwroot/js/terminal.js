@@ -7,7 +7,16 @@ window.TerminalManager = (function(){
     return el;
   }
 
-  function createTerminal(containerEl){
+  // Blend a hex color into black so the pane stays mostly black with a hue of
+  // the project color. strength 0.08 subtle … 0.18 noticeable.
+  function tintTheme(hex, strength){
+    if(!hex || hex[0] !== '#' || hex.length < 7) return {};
+    const r = parseInt(hex.slice(1,3),16), g = parseInt(hex.slice(3,5),16), b = parseInt(hex.slice(5,7),16);
+    const m = v => Math.round(v * strength);
+    return { background: `rgb(${m(r)},${m(g)},${m(b)})`, cursor: hex };
+  }
+
+  function createTerminal(containerEl, color){
     const term = new Terminal({
       fontSize: 14,
       cursorBlink: true,
@@ -15,7 +24,8 @@ window.TerminalManager = (function(){
       allowProposedApi: true,
       disableStdin: true,
       scrollback: 5000,
-      smoothScrollDuration: 120
+      smoothScrollDuration: 120,
+      theme: tintTheme(color, 0.06)
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);

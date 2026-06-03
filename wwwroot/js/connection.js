@@ -107,6 +107,27 @@ window.Connection = (function(){
     sendJson(tab, {cols:c, rows:r});
   }
 
+  // Full recompute for tab switch / wake. Char-size + renderer caches drift
+  // while a container is display:none; a plain fit() that lands on the same
+  // cols/rows is a no-op and leaves the stale layout in place (the bug that
+  // un/re-maximizing fixes). Re-measure, fit across two frames, then repaint.
+  function forceResize(tab){
+    if(!tab) return;
+    applyViewportSize();
+    const core = tab.term._core;
+    try{ core && core._charSizeService && core._charSizeService.measure(); }catch{}
+    requestAnimationFrame(() => {
+      try{ tab.fitAddon.fit(); }catch{ return; }
+      requestAnimationFrame(() => {
+        try{ tab.fitAddon.fit(); }catch{ return; }
+        const c = tab.term.cols, r = tab.term.rows;
+        try{ tab.term.refresh(0, r - 1); }catch{}
+        tab.term.scrollToBottom();
+        sendJson(tab, {cols:c, rows:r});
+      });
+    });
+  }
+
   function disconnect(tab){
     if(tab.reconnectTimer){ clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; }
     if(tab.ws){
@@ -169,5 +190,5 @@ window.Connection = (function(){
     ta.style.height = h;
   }
 
-  return { connect, send, sendJson, sendSize, disconnect, reconnectIfNeeded, refreshTakeover, setBanner, applyViewportSize };
+  return { connect, send, sendJson, sendSize, forceResize, disconnect, reconnectIfNeeded, refreshTakeover, setBanner, applyViewportSize };
 })();

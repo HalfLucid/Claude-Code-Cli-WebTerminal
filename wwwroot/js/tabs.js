@@ -14,7 +14,7 @@ window.TabManager = (function(){
     const id = uuid();
     const sid = uuid();
     const containerEl = TerminalManager.createContainer(id);
-    const { term, fitAddon } = TerminalManager.createTerminal(containerEl);
+    const { term, fitAddon } = TerminalManager.createTerminal(containerEl, color || '#1e6f1e');
 
     const tab = {
       id, sid, kind, projectId,
@@ -38,7 +38,7 @@ window.TabManager = (function(){
   function restoreTab(saved){
     const id = uuid();
     const containerEl = TerminalManager.createContainer(id);
-    const { term, fitAddon } = TerminalManager.createTerminal(containerEl);
+    const { term, fitAddon } = TerminalManager.createTerminal(containerEl, saved.color || '#1e6f1e');
 
     const tab = {
       id,
@@ -84,8 +84,7 @@ window.TabManager = (function(){
     window.sentLen = tab.savedSentLen || 0;
 
     setTimeout(() => {
-      try{ tab.fitAddon.fit(); }catch{}
-      Connection.sendSize(tab);
+      Connection.forceResize(tab);
       ta.focus();
     }, 50);
 
@@ -230,7 +229,7 @@ window.TabManager = (function(){
   function createExternalTab(sid, kind, projectId, label, color){
     const id = uuid();
     const containerEl = TerminalManager.createContainer(id);
-    const { term, fitAddon } = TerminalManager.createTerminal(containerEl);
+    const { term, fitAddon } = TerminalManager.createTerminal(containerEl, color || '#1e6f1e');
 
     const tab = {
       id, sid, kind, projectId,
