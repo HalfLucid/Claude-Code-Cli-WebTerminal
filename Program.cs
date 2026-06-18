@@ -478,7 +478,8 @@ app.MapPost("/api/mcp-setup", () =>
 
     // Loopback HTTP + Bearer header: token stays off the wire and out of the URL (so it doesn't land in logs/history).
     var url = $"http://127.0.0.1:{LoopbackHttpPort}/mcp";
-    var command = $"claude mcp add webterm --transport http \"{url}\" --header \"Authorization: Bearer {mcpKey}\" -s user";
+    // Remove any existing registration first so re-running setup updates the token/url cleanly. `;` continues even if remove fails (not registered).
+    var command = $"claude mcp remove webterm -s user 2>$null; claude mcp add webterm --transport http \"{url}\" --header \"Authorization: Bearer {mcpKey}\" -s user";
     return Results.Json(new { command, url });
 });
 
