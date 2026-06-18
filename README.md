@@ -65,7 +65,7 @@ cd Claude-Code-Cli-WebTerminal
 dotnet run
 ```
 
-On first run you'll be prompted to set a username and password. After setup, the browser opens automatically to `http://localhost:7681`.
+On first run you'll be prompted to set a username and password. After setup, the browser opens automatically to `https://localhost:7681`. The server generates a self-signed TLS certificate on first run (stored DPAPI-encrypted in `webterm-settings.json`), so the browser will show a one-time certificate warning — accept it to proceed.
 
 ## Usage
 
@@ -73,7 +73,7 @@ On first run you'll be prompted to set a username and password. After setup, the
 2. **Claude Code** — add a project (name + directory), then use "Open Claude" or "Resume Claude"
 3. **Tabs** — use the `+` button to open more sessions, click tabs to switch
 4. **Mobile** — tap the arrow button on the right edge to expand the button overlay for touch-friendly input
-5. **Remote access** — access from other devices on your network at `http://<your-ip>:7681` (works great with Tailscale)
+5. **Remote access** — access from other devices on your network at `https://<your-ip>:7681` (works great with Tailscale)
 
 ## Custom Buttons
 
@@ -114,7 +114,7 @@ MCP setup also installs Claude Code hooks that send tab attention notifications 
 | `close_tab` | Close a tab by session ID |
 | `list_tabs` | List all active sessions with metadata |
 
-Auth uses a DPAPI-encrypted API key (separate from Basic auth), passed via `?token=` query parameter.
+Auth uses a DPAPI-encrypted API key (separate from Basic auth), passed via an `Authorization: Bearer <key>` header. The MCP and notify-hook endpoints are served over a loopback-only HTTP port (`127.0.0.1:7680`), so the key never travels over the network.
 
 ## Publishing
 
@@ -122,7 +122,7 @@ Auth uses a DPAPI-encrypted API key (separate from Basic auth), passed via `?tok
 dotnet publish -c Release
 ```
 
-The published app listens on `http://0.0.0.0:7681` on all interfaces.
+The published app listens on `https://0.0.0.0:7681` on all interfaces (self-signed TLS), plus a loopback-only `http://127.0.0.1:7680` for local MCP / notify-hook traffic.
 
 ## License
 

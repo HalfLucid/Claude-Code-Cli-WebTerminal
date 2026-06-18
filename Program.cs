@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -40,9 +42,22 @@ var expected = "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{authU
 
 var bootId = Guid.NewGuid().ToString("N");
 
+const int HttpsPort = 7681;       // TLS, bound on all interfaces (browser + remote)
+const int LoopbackHttpPort = 7680; // plain HTTP, loopback only (local notify hook + claude mcp add)
+
 var authedIps = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
 
+var cert = GetOrCreateCert(sm, settings);
+
 var builder = WebApplication.CreateBuilder(args);
+builder.WebHost.ConfigureKestrel(o =>
+{
+    // HTTPS on every interface — all network-facing traffic (Basic-auth creds, WebSocket) is encrypted.
+    o.ListenAnyIP(HttpsPort, lo => lo.UseHttps(cert));
+    // Plain HTTP bound to loopback only — never reaches the wire, so a self-signed cert isn't needed.
+    // Used by the Claude notify hook (Windows PowerShell 5.1 can't skip cert validation) and local `claude mcp add`.
+    o.ListenLocalhost(LoopbackHttpPort);
+});
 var app = builder.Build();
 
 string GetClientIp(HttpContext ctx)
@@ -61,7 +76,7 @@ app.Use(async (ctx, next) =>
         await next();
         return;
     }
-    if (ctx.Request.Headers.Authorization != expected)
+    if (!TokensEqual(ctx.Request.Headers.Authorization.ToString(), expected))
     {
         var ip = GetClientIp(ctx);
         Log($"AUTH DENIED from {ip} — {ctx.Request.Method} {ctx.Request.Path}");
@@ -318,7 +333,7 @@ app.MapGet("/api/events", async (HttpContext ctx) =>
 
 app.MapPost("/api/notify", async (HttpContext ctx) =>
 {
-    var token = ctx.Request.Query["token"].ToString();
+    var token = ExtractApiToken(ctx);
     var current = sm.Load();
     if (string.IsNullOrEmpty(current.McpKeyProtected) || string.IsNullOrEmpty(token))
     {
@@ -327,7 +342,7 @@ app.MapPost("/api/notify", async (HttpContext ctx) =>
     }
     try
     {
-        if (token != SettingsManager.Unprotect(current.McpKeyProtected))
+        if (!TokensEqual(token, SettingsManager.Unprotect(current.McpKeyProtected)))
         {
             ctx.Response.StatusCode = 401;
             return;
@@ -384,7 +399,7 @@ app.MapPost("/api/mcp-setup", () =>
     var hooksDirPath = Path.Combine(claudeDir, "hooks");
     Directory.CreateDirectory(hooksDirPath);
     var hookScriptPath = Path.Combine(hooksDirPath, "webterm-notify.ps1");
-    File.WriteAllText(hookScriptPath, """
+    File.WriteAllText(hookScriptPath, $$"""
         $sid = $env:WEBTERM_SID
         $token = $env:WEBTERM_NOTIFY_TOKEN
         if (-not $sid -or -not $token) { exit 0 }
@@ -392,7 +407,8 @@ app.MapPost("/api/mcp-setup", () =>
         if (-not $eventType) { exit 0 }
         $body = "{`"sid`":`"$sid`",`"event`":`"$eventType`"}"
         try {
-            Invoke-RestMethod -Uri "http://localhost:7681/api/notify?token=$token" -Method POST -Body $body -ContentType 'application/json' -TimeoutSec 2 2>$null | Out-Null
+            # Loopback-only HTTP port: token never hits the wire, so no TLS / cert handling needed (works on Windows PowerShell 5.1).
+            Invoke-RestMethod -Uri "http://127.0.0.1:{{LoopbackHttpPort}}/api/notify" -Method POST -Headers @{ Authorization = "Bearer $token" } -Body $body -ContentType 'application/json' -TimeoutSec 2 2>$null | Out-Null
         } catch {}
         """);
 
@@ -460,14 +476,15 @@ app.MapPost("/api/mcp-setup", () =>
         Log($"Failed to configure Claude hooks: {ex.Message}");
     }
 
-    var url = $"http://localhost:7681/mcp?token={Uri.EscapeDataString(mcpKey)}";
-    var command = $"claude mcp add webterm --transport http \"{url}\" -s user";
+    // Loopback HTTP + Bearer header: token stays off the wire and out of the URL (so it doesn't land in logs/history).
+    var url = $"http://127.0.0.1:{LoopbackHttpPort}/mcp";
+    var command = $"claude mcp add webterm --transport http \"{url}\" --header \"Authorization: Bearer {mcpKey}\" -s user";
     return Results.Json(new { command, url });
 });
 
 app.MapPost("/mcp", async (HttpContext ctx) =>
 {
-    var token = ctx.Request.Query["token"].ToString();
+    var token = ExtractApiToken(ctx);
     var current = sm.Load();
     if (string.IsNullOrEmpty(current.McpKeyProtected) || string.IsNullOrEmpty(token))
     {
@@ -478,7 +495,7 @@ app.MapPost("/mcp", async (HttpContext ctx) =>
     try
     {
         var expectedKey = SettingsManager.Unprotect(current.McpKeyProtected);
-        if (token != expectedKey)
+        if (!TokensEqual(token, expectedKey))
         {
             ctx.Response.StatusCode = 401;
             await ctx.Response.WriteAsJsonAsync(new { error = "Invalid MCP token" });
@@ -719,21 +736,69 @@ app.Map("/ws", async ctx =>
     await session.Attach(ws, sm, sid, sidShort, ip, Log);
 });
 
-var listenUrl = "http://0.0.0.0:7681";
 app.Lifetime.ApplicationStarted.Register(() =>
 {
     try
     {
         Process.Start(new ProcessStartInfo
         {
-            FileName = "http://localhost:7681",
+            FileName = $"https://localhost:{HttpsPort}",
             UseShellExecute = true
         });
     }
     catch { }
 });
 
-app.Run(listenUrl);
+app.Run();
+
+// Pull the API token from an Authorization: Bearer header. Header-only by design — keeps the token
+// out of URLs (and therefore out of access logs / shell history). Re-run "Add MCP" to reconfigure.
+static string? ExtractApiToken(HttpContext ctx)
+{
+    var auth = ctx.Request.Headers.Authorization.ToString();
+    if (!auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return null;
+    var t = auth["Bearer ".Length..].Trim();
+    return string.IsNullOrEmpty(t) ? null : t;
+}
+
+static bool TokensEqual(string a, string b)
+    => CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(a), Encoding.UTF8.GetBytes(b));
+
+// Load the persisted self-signed cert from settings (DPAPI-protected PFX), or mint a fresh one.
+static X509Certificate2 GetOrCreateCert(SettingsManager sm, WebtermSettings settings)
+{
+    if (!string.IsNullOrEmpty(settings.TlsCertProtected))
+    {
+        try
+        {
+            var stored = Convert.FromBase64String(SettingsManager.Unprotect(settings.TlsCertProtected));
+            var existing = X509CertificateLoader.LoadPkcs12(stored, null, X509KeyStorageFlags.Exportable);
+            if (existing.NotAfter > DateTime.Now.AddDays(7)) return existing;
+        }
+        catch { /* corrupt or expiring — fall through and regenerate */ }
+    }
+
+    var host = Environment.MachineName;
+    using var rsa = RSA.Create(2048);
+    var req = new CertificateRequest($"CN={host}", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+    req.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
+    req.CertificateExtensions.Add(new X509KeyUsageExtension(
+        X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
+    req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+        new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, false)); // serverAuth
+    var san = new SubjectAlternativeNameBuilder();
+    san.AddDnsName(host);
+    san.AddDnsName("localhost");
+    san.AddIpAddress(IPAddress.Loopback);
+    req.CertificateExtensions.Add(san.Build());
+
+    var generated = req.CreateSelfSigned(DateTimeOffset.Now.AddDays(-1), DateTimeOffset.Now.AddYears(5));
+    var pfx = generated.Export(X509ContentType.Pfx);
+    settings.TlsCertProtected = SettingsManager.Protect(Convert.ToBase64String(pfx));
+    sm.Save(settings);
+    // Reload from the exported PFX so Kestrel gets a cert with a usable private key on Windows.
+    return X509CertificateLoader.LoadPkcs12(pfx, null, X509KeyStorageFlags.Exportable);
+}
 
 static string ReadPassword()
 {
@@ -1071,6 +1136,9 @@ class WebtermSettings
 
     [JsonPropertyName("mcpKeyProtected")]
     public string? McpKeyProtected { get; set; }
+
+    [JsonPropertyName("tlsCertProtected")]
+    public string? TlsCertProtected { get; set; }
 }
 
 class CredentialSettings
