@@ -46,6 +46,10 @@ body.has-tabs .btnbar{top:calc(env(safe-area-inset-top,0px) + 69px)}
 .popout{position:fixed;right:80px;z-index:21;background:#1c2333;border:1px solid #4a6680;border-radius:8px;padding:8px;display:none;flex-direction:column;gap:4px;box-shadow:0 4px 12px rgba(0,0,0,0.5)}
 .popout-option{background:#2a3340;color:#bde;border:1px solid #4a6680;border-radius:6px;padding:10px 16px;font:14px monospace;cursor:pointer;text-align:center;touch-action:manipulation}
 .popout-option:hover,.popout-option:active{background:#3a4a5a}
+.term-menu{position:fixed;z-index:70;background:#1c2333;border:1px solid #4a6680;border-radius:8px;padding:4px;display:none;flex-direction:column;min-width:120px;box-shadow:0 4px 12px rgba(0,0,0,0.5);font:14px monospace}
+.term-menu-item{color:#bde;padding:8px 14px;border-radius:6px;cursor:pointer;user-select:none}
+.term-menu-item:hover{background:#3a4a5a}
+.term-menu-item.disabled{color:#556;pointer-events:none}
 
 /* Banner */
 #banner{position:fixed;left:0;right:0;top:0;z-index:30;background:#552a2a;color:#fdd;font:13px monospace;padding:6px 10px;text-align:center;display:none}

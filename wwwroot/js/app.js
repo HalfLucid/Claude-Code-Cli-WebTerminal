@@ -60,11 +60,31 @@
     if(k === 'Home'){ e.preventDefault(); sendActive(e.ctrlKey ? '\x1b[1;5H' : e.shiftKey ? '\x1b[1;2H' : '\x1b[H'); resetTa(); return; }
     if(k === 'End'){ e.preventDefault(); sendActive(e.ctrlKey ? '\x1b[1;5F' : e.shiftKey ? '\x1b[1;2F' : '\x1b[F'); resetTa(); return; }
     if(k === 'Escape'){ e.preventDefault(); sendActive('\x1b'); resetTa(); return; }
-    if(e.ctrlKey && k.length === 1){
-      const c = k.toLowerCase().charCodeAt(0);
+    if(e.ctrlKey && !e.altKey && k.length === 1){
+      const lc = k.toLowerCase();
+      // Ctrl+C: copy if there's a selection, otherwise fall through to send ^C (SIGINT).
+      if(lc === 'c'){
+        const t = TabManager.getActive();
+        const sel = t && t.term.getSelection();
+        if(sel){ e.preventDefault(); copyText(sel); t.term.clearSelection(); return; }
+      }
+      // Ctrl+V: paste clipboard into the PTY (never send raw 0x16).
+      if(lc === 'v'){ e.preventDefault(); pasteClipboard(); return; }
+      const c = lc.charCodeAt(0);
       if(c >= 97 && c <= 122){ e.preventDefault(); sendActive(String.fromCharCode(c - 96)); resetTa(); return; }
     }
   });
+
+  function copyText(s){
+    if(navigator.clipboard) return navigator.clipboard.writeText(s).catch(()=>{});
+  }
+  function pasteClipboard(){
+    if(navigator.clipboard && navigator.clipboard.readText){
+      navigator.clipboard.readText().then(t => { if(t) sendActive(t); }).catch(()=>{});
+    }
+  }
+  window.copyText = copyText;
+  window.pasteClipboard = pasteClipboard;
 
   document.addEventListener('click', e => {
     if(window.inputEnabled === false) return;   // keyboard locked off — don't refocus

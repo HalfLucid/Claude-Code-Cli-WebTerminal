@@ -479,7 +479,9 @@ app.MapPost("/api/mcp-setup", () =>
     // Loopback HTTP + Bearer header: token stays off the wire and out of the URL (so it doesn't land in logs/history).
     var url = $"http://127.0.0.1:{LoopbackHttpPort}/mcp";
     // Remove any existing registration first so re-running setup updates the token/url cleanly. `;` continues even if remove fails (not registered).
-    var command = $"claude mcp remove webterm -s user 2>$null; claude mcp add webterm --transport http \"{url}\" --header \"Authorization: Bearer {mcpKey}\" -s user";
+    // Single-quote the sid header so PowerShell passes ${WEBTERM_SID} literally to claude, which expands it per-session at config load.
+    // ${WEBTERM_SID:-} keeps config parseable when the var is unset (claude run outside a webterm tab) — server then falls back to default cwd.
+    var command = $"claude mcp remove webterm -s user 2>$null; claude mcp add webterm --transport http \"{url}\" --header \"Authorization: Bearer {mcpKey}\" --header 'X-Webterm-Sid: ${{WEBTERM_SID:-}}' -s user";
     return Results.Json(new { command, url });
 });
 
@@ -520,6 +522,7 @@ app.MapPost("/mcp", async (HttpContext ctx) =>
 
     var id = req.TryGetProperty("id", out var idProp) ? idProp : (JsonElement?)null;
     var method = req.TryGetProperty("method", out var m) ? m.GetString() : null;
+    var callerSid = ctx.Request.Headers["X-Webterm-Sid"].FirstOrDefault();
 
     object response = method switch
     {
@@ -567,7 +570,7 @@ app.MapPost("/mcp", async (HttpContext ctx) =>
                     new { type = "object", properties = new Dictionary<string, object>() })
             }
         }),
-        "tools/call" => McpHandleToolCall(req, id),
+        "tools/call" => McpHandleToolCall(req, id, callerSid),
         _ => McpError(id, -32601, $"Method not found: {method}")
     };
 
@@ -592,14 +595,14 @@ object McpError(JsonElement? id, int code, string message) => new
 
 object McpToolDef(string name, string description, object inputSchema) => new { name, description, inputSchema };
 
-object McpHandleToolCall(JsonElement req, JsonElement? id)
+object McpHandleToolCall(JsonElement req, JsonElement? id, string? callerSid)
 {
     var toolName = req.GetProperty("params").GetProperty("name").GetString();
     var args = req.GetProperty("params").TryGetProperty("arguments", out var a) ? a : default;
 
     return toolName switch
     {
-        "open_tab" => McpOpenTab(id, args),
+        "open_tab" => McpOpenTab(id, args, callerSid),
         "close_tab" => McpCloseTab(id, args),
         "list_tabs" => McpListTabs(id),
         "restart" => McpRestart(id),
@@ -607,12 +610,17 @@ object McpHandleToolCall(JsonElement req, JsonElement? id)
     };
 }
 
-object McpOpenTab(JsonElement? id, JsonElement args)
+object McpOpenTab(JsonElement? id, JsonElement args, string? callerSid)
 {
     var kind = args.TryGetProperty("kind", out var k) ? k.GetString() ?? "powershell" : "powershell";
     var projectId = args.TryGetProperty("projectId", out var p) ? p.GetString() : null;
     var label = args.TryGetProperty("label", out var l) ? l.GetString() : kind;
     var command = args.TryGetProperty("command", out var c) ? c.GetString() : null;
+
+    // Default to the calling Claude's own project when caller didn't specify one.
+    // Caller sid arrives via the X-Webterm-Sid header (expanded from ${WEBTERM_SID} per session).
+    if (projectId == null && !string.IsNullOrEmpty(callerSid) && sessions.TryGetValue(callerSid, out var caller))
+        projectId = caller.ProjectId;
 
     string color = "#1e6f1e";
     if (kind != "powershell" && projectId != null)
@@ -932,9 +940,10 @@ sealed class Session : IDisposable
 
         if (!string.IsNullOrEmpty(defaultCommand))
         {
+            // Wait for the shell/TUI to boot its input loop before sending; an early send gets swallowed.
             _ = Task.Run(async () =>
             {
-                await Task.Delay(500);
+                await Task.Delay(6000);
                 var bytes = System.Text.Encoding.UTF8.GetBytes(defaultCommand + "\r");
                 await Pty.WriterStream.WriteAsync(bytes);
                 await Pty.WriterStream.FlushAsync();

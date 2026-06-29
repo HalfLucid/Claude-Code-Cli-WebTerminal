@@ -1,4 +1,36 @@
 window.TerminalManager = (function(){
+  // Single shared right-click menu (xterm renders selection on canvas, so the
+  // browser's native context menu never offers Copy/Paste — provide our own).
+  let menuEl = null;
+  function hideMenu(){ if(menuEl) menuEl.style.display = 'none'; }
+  function ensureMenu(){
+    if(menuEl) return menuEl;
+    menuEl = document.createElement('div');
+    menuEl.className = 'term-menu';
+    menuEl.innerHTML = '<div class="term-menu-item" data-act="copy">Copy</div>' +
+                       '<div class="term-menu-item" data-act="paste">Paste</div>';
+    document.body.appendChild(menuEl);
+    document.addEventListener('click', hideMenu);
+    document.addEventListener('scroll', hideMenu, true);
+    window.addEventListener('blur', hideMenu);
+    return menuEl;
+  }
+  function showMenu(x, y, term){
+    const el = ensureMenu();
+    const sel = term.getSelection();
+    const copyItem = el.querySelector('[data-act="copy"]');
+    copyItem.classList.toggle('disabled', !sel);
+    el.onclick = e => {
+      const act = e.target.getAttribute('data-act');
+      if(act === 'copy' && sel){ window.copyText && window.copyText(sel); term.clearSelection(); }
+      else if(act === 'paste'){ window.pasteClipboard && window.pasteClipboard(); }
+      hideMenu();
+    };
+    el.style.display = 'block';
+    el.style.left = Math.min(x, window.innerWidth - el.offsetWidth - 4) + 'px';
+    el.style.top = Math.min(y, window.innerHeight - el.offsetHeight - 4) + 'px';
+  }
+
   function createContainer(tabId){
     const el = document.createElement('div');
     el.id = 'term-' + tabId;
@@ -32,6 +64,10 @@ window.TerminalManager = (function(){
     term.open(containerEl);
     const coreEl = containerEl.querySelector('.xterm');
     if(coreEl){
+      coreEl.addEventListener('contextmenu', e => {
+        e.preventDefault();
+        showMenu(e.clientX, e.clientY, term);
+      });
       const refocus = () => setTimeout(() => document.getElementById('ta').focus(), 0);
       // Desktop: click anywhere in terminal focuses input.
       coreEl.addEventListener('mousedown', () => { if(window.inputEnabled !== false) refocus(); });
