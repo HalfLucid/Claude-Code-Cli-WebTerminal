@@ -109,6 +109,133 @@ app.UseStaticFiles(new StaticFileOptions
 
 var sessions = new ConcurrentDictionary<string, Session>();
 var sseClients = new ConcurrentDictionary<string, Channel<string>>();
+var pendingFiles = new ConcurrentDictionary<string, string>(); // id -> absolute host path
+
+static (string contentType, string kind) FileMeta(string path)
+{
+    var ext = Path.GetExtension(path).ToLowerInvariant();
+    return ext switch
+    {
+        ".png" => ("image/png", "image"),
+        ".jpg" or ".jpeg" => ("image/jpeg", "image"),
+        ".gif" => ("image/gif", "image"),
+        ".webp" => ("image/webp", "image"),
+        ".bmp" => ("image/bmp", "image"),
+        ".svg" => ("image/svg+xml", "image"),
+        ".mp4" => ("video/mp4", "video"),
+        ".webm" => ("video/webm", "video"),
+        ".mov" => ("video/quicktime", "video"),
+        ".mkv" => ("video/x-matroska", "video"),
+        ".m4v" => ("video/x-m4v", "video"),
+        ".mp3" => ("audio/mpeg", "audio"),
+        ".wav" => ("audio/wav", "audio"),
+        ".ogg" => ("audio/ogg", "audio"),
+        ".m4a" => ("audio/mp4", "audio"),
+        ".flac" => ("audio/flac", "audio"),
+        _ => ("application/octet-stream", "other")
+    };
+}
+
+const int MaxUploadBytes = 20 * 1024 * 1024;
+const string UploadSubdir = ".webterm";
+
+// Where files pasted/dropped in the browser land. Inside the tab's project so the
+// path handed to Claude sits under its cwd (no Read permission prompt); tabs with
+// no project (PowerShell) fall back to a temp folder.
+string UploadDirFor(string? projectId)
+{
+    var dir = projectId is null
+        ? null
+        : sm.Load().Projects.FirstOrDefault(p => p.Id == projectId)?.Directory;
+
+    if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir))
+        return Path.Combine(Path.GetTempPath(), "webterm-uploads");
+
+    // A .gitignore of "*" ignores itself too, so the whole folder stays invisible
+    // to git without touching the project's own ignore rules.
+    var root = Path.Combine(dir, UploadSubdir);
+    var ignore = Path.Combine(root, ".gitignore");
+    Directory.CreateDirectory(root);
+    if (!File.Exists(ignore)) File.WriteAllText(ignore, "*\n");
+    return Path.Combine(root, "uploads");
+}
+
+// Every directory the sweeper may hold files in, derived from settings each pass
+// so projects added or removed between restarts are still covered.
+IEnumerable<string> UploadDirs()
+{
+    yield return Path.Combine(Path.GetTempPath(), "webterm-uploads");
+    foreach (var p in sm.Load().Projects)
+        if (!string.IsNullOrWhiteSpace(p.Directory))
+            yield return Path.Combine(p.Directory, UploadSubdir, "uploads");
+}
+
+static string ExtForContentType(string? contentType) => contentType switch
+{
+    "image/png" => ".png",
+    "image/jpeg" => ".jpg",
+    "image/gif" => ".gif",
+    "image/webp" => ".webp",
+    "image/bmp" => ".bmp",
+    "image/svg+xml" => ".svg",
+    _ => ".bin"
+};
+
+static string SanitizeStem(string s)
+{
+    var invalid = Path.GetInvalidFileNameChars();
+    var sb = new StringBuilder();
+    foreach (var ch in s)
+        sb.Append(char.IsWhiteSpace(ch) || Array.IndexOf(invalid, ch) >= 0 ? '_' : ch);
+    var name = sb.ToString().Trim('_', '.');
+    if (name.Length > 60) name = name[..60];
+    return name.Length == 0 ? "file" : name;
+}
+
+static string UniqueUploadPath(string dir, string? originalName, string? contentType)
+{
+    var ext = Path.GetExtension(originalName ?? "");
+    if (string.IsNullOrEmpty(ext)) ext = ExtForContentType(contentType);
+
+    // Clipboard screenshots arrive nameless or as a generic "image" — timestamp
+    // them so consecutive pastes don't all collide on one name.
+    var stem = Path.GetFileNameWithoutExtension(originalName ?? "");
+    stem = string.IsNullOrWhiteSpace(stem) || stem.Equals("image", StringComparison.OrdinalIgnoreCase)
+        ? $"paste-{DateTime.Now:yyyyMMdd-HHmmss}"
+        : SanitizeStem(stem);
+
+    var candidate = Path.Combine(dir, stem + ext);
+    for (var i = 2; File.Exists(candidate); i++)
+        candidate = Path.Combine(dir, $"{stem}-{i}{ext}");
+    return candidate;
+}
+
+_ = Task.Run(async () =>
+{
+    while (true)
+    {
+        try
+        {
+            var cutoff = DateTime.UtcNow - TimeSpan.FromDays(1);
+            foreach (var dir in UploadDirs())
+            {
+                if (!Directory.Exists(dir)) continue;
+                foreach (var file in Directory.EnumerateFiles(dir))
+                {
+                    try
+                    {
+                        if (File.GetLastWriteTimeUtc(file) >= cutoff) continue;
+                        File.Delete(file);
+                        Log($"UPLOAD SWEPT {file}");
+                    }
+                    catch { }
+                }
+            }
+        }
+        catch { }
+        await Task.Delay(TimeSpan.FromHours(1));
+    }
+});
 
 void BroadcastSse(string eventType, object data)
 {
@@ -296,6 +423,59 @@ app.MapDelete("/api/sessions/{sid}", (string sid) =>
     session.Dispose();
     BroadcastSse("tab_closed", new { sid });
     return Results.Ok(new { closed = sid });
+});
+
+app.MapGet("/api/file/{id}", (string id) =>
+{
+    if (!pendingFiles.TryGetValue(id, out var path) || !File.Exists(path))
+        return Results.NotFound();
+
+    var (contentType, kind) = FileMeta(path);
+    // Range processing lets the browser seek in video/audio.
+    return Results.File(path, contentType,
+        fileDownloadName: kind == "other" ? Path.GetFileName(path) : null,
+        enableRangeProcessing: true);
+});
+
+app.MapDelete("/api/file/{id}", (string id) =>
+{
+    pendingFiles.TryRemove(id, out _);
+    return Results.NoContent();
+});
+
+app.MapPost("/api/upload", async (HttpContext ctx) =>
+{
+    if (!ctx.Request.HasFormContentType)
+        return Results.BadRequest(new { error = "Expected multipart/form-data" });
+
+    // Kestrel's 30 MB default would reject a multi-image drop before the handler
+    // ever runs, hiding the real per-file limit enforced below.
+    var sizeLimit = ctx.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpMaxRequestBodySizeFeature>();
+    if (sizeLimit is { IsReadOnly: false }) sizeLimit.MaxRequestBodySize = 128L * 1024 * 1024;
+
+    var sid = ctx.Request.Query["sid"].ToString();
+    var sidShort = sid.Length >= 8 ? sid[..8] : sid;
+    sessions.TryGetValue(sid, out var session);
+
+    var dir = UploadDirFor(session?.ProjectId);
+    Directory.CreateDirectory(dir);
+
+    var form = await ctx.Request.ReadFormAsync();
+    var saved = new List<string>();
+    foreach (var file in form.Files)
+    {
+        if (file.Length <= 0) continue;
+        if (file.Length > MaxUploadBytes)
+            return Results.BadRequest(new { error = $"{file.FileName} exceeds the {MaxUploadBytes / (1024 * 1024)} MB limit" });
+
+        var path = UniqueUploadPath(dir, file.FileName, file.ContentType);
+        await using (var fs = File.Create(path))
+            await file.CopyToAsync(fs);
+        saved.Add(path);
+        Log($"UPLOAD sid={sidShort}… {Path.GetFileName(path)} ({file.Length / 1024} KB) -> {dir}");
+    }
+
+    return Results.Json(new { paths = saved });
 });
 
 app.MapGet("/api/events", async (HttpContext ctx) =>
@@ -567,7 +747,19 @@ app.MapPost("/mcp", async (HttpContext ctx) =>
                     new { type = "object", properties = new Dictionary<string, object>() }),
                 McpToolDef("restart",
                     "Rebuild and restart the WebTerm server. Kills all sessions.",
-                    new { type = "object", properties = new Dictionary<string, object>() })
+                    new { type = "object", properties = new Dictionary<string, object>() }),
+                McpToolDef("show_file",
+                    "Display a file from a host file path in the WebTerm browser. Images and videos render in an overlay viewer; other file types show a download link. The file is served from disk on demand and is not copied or deleted.",
+                    new
+                    {
+                        type = "object",
+                        properties = new Dictionary<string, object>
+                        {
+                            ["path"] = new { type = "string", description = "Absolute path to the file on the host computer" },
+                            ["caption"] = new { type = "string", description = "Optional caption shown under the file" }
+                        },
+                        required = new[] { "path" }
+                    })
             }
         }),
         "tools/call" => McpHandleToolCall(req, id, callerSid),
@@ -606,6 +798,7 @@ object McpHandleToolCall(JsonElement req, JsonElement? id, string? callerSid)
         "close_tab" => McpCloseTab(id, args),
         "list_tabs" => McpListTabs(id),
         "restart" => McpRestart(id),
+        "show_file" => McpShowFile(id, args),
         _ => McpError(id, -32602, $"Unknown tool: {toolName}")
     };
 }
@@ -642,6 +835,44 @@ object McpOpenTab(JsonElement? id, JsonElement args, string? callerSid)
     return McpResult(id, new
     {
         content = new[] { new { type = "text", text = $"Tab opened: sid={sid}, kind={kind}, label={label}" } }
+    });
+}
+
+object McpShowFile(JsonElement? id, JsonElement args)
+{
+    var path = args.TryGetProperty("path", out var p) ? p.GetString() : null;
+    var caption = args.TryGetProperty("caption", out var c) ? c.GetString() : null;
+
+    if (string.IsNullOrWhiteSpace(path))
+        return McpError(id, -32602, "Missing required parameter: path");
+
+    var full = Path.GetFullPath(path);
+    if (!File.Exists(full))
+        return McpResult(id, new
+        {
+            content = new[] { new { type = "text", text = $"File not found: {full}" } },
+            isError = true
+        });
+
+    var fileId = Guid.NewGuid().ToString();
+    pendingFiles[fileId] = full;
+
+    // Cap retained references so old entries don't accumulate.
+    while (pendingFiles.Count > 50)
+    {
+        var oldest = pendingFiles.Keys.FirstOrDefault();
+        if (oldest == null || oldest == fileId) break;
+        pendingFiles.TryRemove(oldest, out _);
+    }
+
+    var name = Path.GetFileName(full);
+    var (_, kind) = FileMeta(full);
+    BroadcastSse("show_file", new { id = fileId, name, caption, kind });
+    Log($"MCP SHOW_FILE id={fileId[..8]}… kind={kind} name={name}");
+
+    return McpResult(id, new
+    {
+        content = new[] { new { type = "text", text = $"File displayed ({kind}): {name}" } }
     });
 }
 
