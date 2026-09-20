@@ -15,7 +15,7 @@ ASP.NET Core minimal API backend + xterm.js frontend. Connects your browser to a
 - **Server-sourced session registry** — tab state lives on the server, not in localStorage. Any browser connecting sees all active sessions. Cross-device by default.
 - **Real-time tab sync via SSE** — Server-Sent Events push `tab_opened` / `tab_closed` notifications to all connected browsers instantly (MCP-created tabs, cross-device opens, idle reaps).
 - **Tab attention notifications** — Claude Code hooks notify WebTerm when Claude needs approval or finishes. Tab bar shows attention indicators, the page title flashes, and browser push notifications fire when you're not looking. Auto-configured during MCP setup.
-- **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) endpoint at `/mcp`. Tools: `open_tab`, `close_tab`, `list_tabs`. Lets Claude Code (or any MCP client) open and manage terminal tabs programmatically. One-click setup from the main screen.
+- **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io/) endpoint at `/mcp`. Tools: `open_tab`, `close_tab`, `list_tabs`, `restart`, `show_file`, `copy_text`. Lets Claude Code (or any MCP client) open and manage terminal tabs, push files to the browser, and put text on your device's clipboard. One-click setup from the main screen.
 - **Basic auth** — credentials set on first run, encrypted with Windows DPAPI.
 - **Startup toggle** — optional Windows startup registration from the main screen.
 - **Configurable buttons** — reorder built-in buttons, switch Claude model/effort, and create custom buttons that send any text to the terminal. Custom buttons can trigger slash commands (e.g. `/review`), full prompts (e.g. `summarize all changes, commit, and create a pull request`), or any terminal input.
@@ -113,6 +113,9 @@ MCP setup also installs Claude Code hooks that send tab attention notifications 
 | `open_tab` | Open a new terminal tab (PowerShell, Claude, or Claude resume). Optionally specify a project, label, or command to run on launch. |
 | `close_tab` | Close a tab by session ID |
 | `list_tabs` | List all active sessions with metadata |
+| `restart` | Rebuild and restart the WebTerm server (kills all sessions) |
+| `show_file` | Display a host file (image, video, audio, or download link) in the browser |
+| `copy_text` | Put text on the clipboard of the device viewing WebTerm. Silent write when the browser allows it; otherwise a Copy button appears. |
 
 Auth uses a DPAPI-encrypted API key (separate from Basic auth), passed via an `Authorization: Bearer <key>` header. The MCP and notify-hook endpoints are served over a loopback-only HTTP port (`127.0.0.1:7680`), so the key never travels over the network.
 

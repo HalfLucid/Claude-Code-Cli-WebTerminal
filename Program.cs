@@ -759,6 +759,18 @@ app.MapPost("/mcp", async (HttpContext ctx) =>
                             ["caption"] = new { type = "string", description = "Optional caption shown under the file" }
                         },
                         required = new[] { "path" }
+                    }),
+                McpToolDef("copy_text",
+                    "Copy text to the clipboard of the device viewing WebTerm in a browser. The browser tries a silent clipboard write; if the browser blocks that (page not focused, Safari/iOS), it shows the text with a Copy button the user can tap. Max 1 MB.",
+                    new
+                    {
+                        type = "object",
+                        properties = new Dictionary<string, object>
+                        {
+                            ["text"] = new { type = "string", description = "The text to place on the clipboard" },
+                            ["label"] = new { type = "string", description = "Optional short description shown in the browser notification (e.g. 'SQL query', 'commit message')" }
+                        },
+                        required = new[] { "text" }
                     })
             }
         }),
@@ -799,6 +811,7 @@ object McpHandleToolCall(JsonElement req, JsonElement? id, string? callerSid)
         "list_tabs" => McpListTabs(id),
         "restart" => McpRestart(id),
         "show_file" => McpShowFile(id, args),
+        "copy_text" => McpCopyText(id, args),
         _ => McpError(id, -32602, $"Unknown tool: {toolName}")
     };
 }
@@ -873,6 +886,38 @@ object McpShowFile(JsonElement? id, JsonElement args)
     return McpResult(id, new
     {
         content = new[] { new { type = "text", text = $"File displayed ({kind}): {name}" } }
+    });
+}
+
+object McpCopyText(JsonElement? id, JsonElement args)
+{
+    var text = args.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString() : null;
+    var label = args.TryGetProperty("label", out var l) && l.ValueKind == JsonValueKind.String ? l.GetString() : null;
+
+    if (text == null)
+        return McpError(id, -32602, "Missing required parameter: text");
+
+    const int maxChars = 1024 * 1024;
+    if (text.Length > maxChars)
+        return McpResult(id, new
+        {
+            content = new[] { new { type = "text", text = $"Text too large ({text.Length} chars); limit is {maxChars}" } },
+            isError = true
+        });
+
+    if (sseClients.IsEmpty)
+        return McpResult(id, new
+        {
+            content = new[] { new { type = "text", text = "No browser is connected to WebTerm, so nothing was copied" } },
+            isError = true
+        });
+
+    BroadcastSse("copy_text", new { text, label });
+    Log($"MCP COPY_TEXT chars={text.Length} label={label ?? "-"} browsers={sseClients.Count}");
+
+    return McpResult(id, new
+    {
+        content = new[] { new { type = "text", text = $"Sent {text.Length} chars to {sseClients.Count} connected browser(s). The user gets a Copy button if their browser blocked the silent write." } }
     });
 }
 

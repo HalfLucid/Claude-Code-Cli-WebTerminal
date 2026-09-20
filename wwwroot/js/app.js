@@ -366,6 +366,89 @@
     document.addEventListener('keydown', onKey);
   }
 
+  // Silent write needs focus/gesture browsers won't grant here; see CLAUDE.md.
+  function receiveCopyText(text, label){
+    var what = label ? ('“' + label + '”') : 'text';
+    var tryWrite = (navigator.clipboard && navigator.clipboard.writeText && document.hasFocus())
+      ? navigator.clipboard.writeText(text)
+      : Promise.reject(new Error('clipboard unavailable'));
+    tryWrite.then(function(){
+      showToast('✓ Copied ' + what + ' to clipboard');
+    }, function(){
+      showCopyOverlay(text, label);
+    });
+  }
+
+  function showCopyOverlay(text, label){
+    var existing = document.getElementById('copy-overlay');
+    if(existing) existing._dismiss ? existing._dismiss() : existing.remove();
+
+    var overlay = document.createElement('div');
+    overlay.id = 'copy-overlay';
+    overlay.className = 'img-overlay';
+
+    var box = document.createElement('div');
+    box.className = 'copy-box';
+
+    var title = document.createElement('div');
+    title.className = 'copy-title';
+    title.textContent = label ? ('Claude wants to copy: ' + label) : 'Claude wants to copy text';
+    box.appendChild(title);
+
+    var pre = document.createElement('textarea');
+    pre.className = 'copy-preview';
+    pre.readOnly = true;
+    pre.value = text;
+    box.appendChild(pre);
+
+    var meta = document.createElement('div');
+    meta.className = 'copy-meta';
+    meta.textContent = text.length + ' chars · tap Copy, or select the text above';
+    box.appendChild(meta);
+
+    var actions = document.createElement('div');
+    actions.className = 'modal-actions';
+    var copyBtn = document.createElement('button');
+    copyBtn.className = 'modal-save';
+    copyBtn.textContent = 'Copy';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.className = 'modal-cancel';
+    cancelBtn.textContent = 'Dismiss';
+    actions.appendChild(copyBtn);
+    actions.appendChild(cancelBtn);
+    box.appendChild(actions);
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    function dismiss(){
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+    }
+    overlay._dismiss = dismiss;
+    function onKey(ev){ if(ev.key === 'Escape') dismiss(); }
+
+    copyBtn.addEventListener('click', function(){
+      // Runs inside a click handler, so this has user activation everywhere.
+      var p = (navigator.clipboard && navigator.clipboard.writeText)
+        ? navigator.clipboard.writeText(text)
+        : Promise.reject(new Error('no clipboard API'));
+      p.then(function(){
+        dismiss();
+        showToast('✓ Copied to clipboard');
+      }, function(){
+        var ok = false;
+        try { pre.focus(); pre.select(); ok = document.execCommand('copy'); } catch(_){}
+        if(ok){ dismiss(); showToast('✓ Copied to clipboard'); }
+        else meta.textContent = 'Clipboard blocked — select the text above and copy it manually';
+      });
+    });
+    cancelBtn.addEventListener('click', dismiss);
+    overlay.addEventListener('click', function(ev){ if(ev.target === overlay) dismiss(); });
+    document.addEventListener('keydown', onKey);
+    copyBtn.focus();
+  }
+
   function setupImageZoom(view, img){
     var scale = 1, tx = 0, ty = 0;
     var MIN = 1, MAX = 8;
@@ -483,6 +566,10 @@
     es.addEventListener('show_file', function(e){
       var data = JSON.parse(e.data);
       showFileOverlay(data.id, data.name, data.caption, data.kind);
+    });
+    es.addEventListener('copy_text', function(e){
+      var data = JSON.parse(e.data);
+      receiveCopyText(data.text || '', data.label);
     });
     es.addEventListener('tab_idle', function(e){
       var data = JSON.parse(e.data);

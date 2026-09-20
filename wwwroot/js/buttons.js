@@ -15,6 +15,7 @@ window.ButtonBar = (function(){
     'cmpt':        { label:'CMPT',   fn:()=>{ resetTa(); sendActive('/compact\r'); } },
     'scroll-up':   { label:'SCR &#8593;',  fn:()=>{ var t = getActiveTerm(); if(t) t.scrollLines(-Math.max(1, t.rows - 2)); }, minimizedOnly:true },
     'scroll-down': { label:'SCR &#8595;',  fn:()=>{ var t = getActiveTerm(); if(t) t.scrollLines(Math.max(1, t.rows - 2)); }, minimizedOnly:true },
+    'reload':      { label:'&#8635;',  fn:()=>{ var tab = TabManager.getActive(); if(tab) Connection.forceResize(tab); }, minimizedOnly:true },
     'model':       { label:'Model',  fn:showModelPopout, isPopout:true },
     'effort':      { label:'Effort', fn:showEffortPopout, isPopout:true },
   };
