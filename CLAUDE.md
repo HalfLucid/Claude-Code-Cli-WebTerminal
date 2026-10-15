@@ -94,7 +94,7 @@ Key pieces inside `Session`:
 ### Button overlay
 
 Configurable button bar on right side. Two states:
-- **Collapsed:** shows only the `minimizedOnly` buttons — scroll-up, scroll-down, and reload (forces a PTY resize via `Connection.forceResize`, useful when the terminal renders stale after a tab switch)
+- **Collapsed:** shows only the `minimizedOnly` buttons — scroll-up, scroll-down, and reload (`Connection.hardRefresh`: resets input state, wipes xterm, opens a fresh WebSocket so the ring buffer replays, then nudges the PTY one column narrower and back so ConPTY/Claude repaint the screen. A same-size resize is a no-op in ConPTY, which is why maximize/restore used to be the only reliable fix)
 - **Expanded:** shows all configured buttons (enter, arrows, ctrl combos, model/effort popouts, custom buttons)
 
 Button order and custom buttons are persisted in settings and configurable via the button config modal on the main screen. Model/effort buttons show popout panels with options (sends `/model <name>\r` to PTY).

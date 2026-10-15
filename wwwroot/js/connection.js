@@ -16,6 +16,9 @@ window.Connection = (function(){
         setBanner('');
         sendSize(tab);
       }
+      // Queued by hardRefresh. Sent on the new socket, so the server handles it
+      // after the ring-buffer replay and the repaint lands on top of it.
+      if(tab.pendingJiggle){ tab.pendingJiggle = false; jiggle(tab); }
     };
 
     sock.onmessage = e => {
@@ -113,9 +116,7 @@ window.Connection = (function(){
   // un/re-maximizing fixes). Re-measure, fit across two frames, then repaint.
   function forceResize(tab){
     if(!tab) return;
-    applyViewportSize();
-    const core = tab.term._core;
-    try{ core && core._charSizeService && core._charSizeService.measure(); }catch{}
+    remeasure(tab);
     requestAnimationFrame(() => {
       try{ tab.fitAddon.fit(); }catch{ return; }
       requestAnimationFrame(() => {
@@ -126,6 +127,43 @@ window.Connection = (function(){
         sendJson(tab, {cols:c, rows:r});
       });
     });
+  }
+
+  // xterm pauses rendering via IntersectionObserver while its container is
+  // hidden. If the observer misses the unhide, output keeps arriving but never
+  // paints (looks like dead input) until a real window resize fires it.
+  function remeasure(tab){
+    applyViewportSize();
+    const core = tab.term._core;
+    try{ core && core._charSizeService && core._charSizeService.measure(); }catch{}
+    try{ const rs = core && core._renderService; if(rs && rs._isPaused) rs._isPaused = false; }catch{}
+  }
+
+  // ConPTY only repaints (and Claude only re-renders) on a real size change;
+  // resizing to the current size is a no-op. That's why maximize/restore fixes
+  // a garbled screen. Nudge one column narrower, then back. The gap lets the
+  // app observe the intermediate size instead of coalescing it away.
+  function jiggle(tab){
+    const r = tab.term.rows;
+    sendJson(tab, {cols: Math.max(tab.term.cols - 1, 2), rows: r});
+    setTimeout(() => sendJson(tab, {cols: tab.term.cols, rows: tab.term.rows}), 150);
+  }
+
+  // Reload button: rebuild everything from scratch. Wipes xterm state, opens a
+  // fresh socket (replaces a half-open one after sleep), replays the server
+  // ring buffer, then forces the app to repaint the screen over the replay.
+  function hardRefresh(tab){
+    if(!tab) return;
+    if(window.resetInput) window.resetInput();
+    disconnect(tab);
+    tab.takenOver = false;
+    refreshTakeover(tab);
+    remeasure(tab);
+    try{ tab.term.reset(); }catch{}
+    try{ tab.fitAddon.fit(); }catch{}
+    tab.pendingJiggle = true;
+    tab.reconnectDelay = 500;
+    connect(tab);
   }
 
   function disconnect(tab){
@@ -190,5 +228,5 @@ window.Connection = (function(){
     ta.style.height = h;
   }
 
-  return { connect, send, sendJson, sendSize, forceResize, disconnect, reconnectIfNeeded, refreshTakeover, setBanner, applyViewportSize };
+  return { connect, send, sendJson, sendSize, forceResize, hardRefresh, disconnect, reconnectIfNeeded, refreshTakeover, setBanner, applyViewportSize };
 })();

@@ -345,7 +345,12 @@ app.MapPost("/api/startup", async (HttpContext ctx) =>
     {
         var exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName;
         if (exePath is null) return Results.Problem("Cannot determine executable path");
-        var workDir = Path.GetDirectoryName(exePath)!;
+        // Start in the content root (the folder holding wwwroot), not the exe's folder — a Debug build
+        // output has no wwwroot, so launching from bin\ would serve no static files.
+        var contentRoot = app.Environment.ContentRootPath;
+        var workDir = Directory.Exists(Path.Combine(contentRoot, "wwwroot"))
+            ? contentRoot
+            : Path.GetDirectoryName(exePath)!;
         // Use PowerShell to create .lnk shortcut (no COM interop needed)
         var ps = new ProcessStartInfo
         {

@@ -42,6 +42,13 @@
 
   ta.addEventListener('compositionstart', ()=>{ composing = true; });
   ta.addEventListener('compositionend', ()=>{ composing = false; rewrite(); });
+  // A composition interrupted by a tab switch / sleep may never get its
+  // compositionend, leaving composing stuck true and every input ignored.
+  ta.addEventListener('blur', ()=>{ composing = false; });
+  window.resetInput = function(){
+    composing = false; ta.value = ''; sentLen = 0;
+    if(window.inputEnabled !== false) ta.focus();
+  };
   ta.addEventListener('input', ()=>{ if(!composing) rewrite(); });
 
   ta.addEventListener('keydown', e => {
