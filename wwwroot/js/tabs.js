@@ -78,10 +78,10 @@ window.TabManager = (function(){
     var ta = document.getElementById('ta');
     if(prevTab){
       prevTab.savedInput = ta.value;
-      prevTab.savedSentLen = window.sentLen;
+      prevTab.savedSent = window.sentText;
     }
     ta.value = tab.savedInput || '';
-    window.sentLen = tab.savedSentLen || 0;
+    window.sentText = tab.savedSent || '';
 
     setTimeout(() => {
       Connection.forceResize(tab);

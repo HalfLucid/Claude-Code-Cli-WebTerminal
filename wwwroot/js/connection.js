@@ -5,7 +5,8 @@ window.Connection = (function(){
   function connect(tab){
     if(tab.ws && (tab.ws.readyState === 0 || tab.ws.readyState === 1)) return;
     tab.takenOver = false;
-    const url = wsProto + location.host + '/ws?sid=' + encodeURIComponent(tab.sid);
+    let url = wsProto + location.host + '/ws?sid=' + encodeURIComponent(tab.sid);
+    if(tab.recvOffset != null) url += '&from=' + tab.recvOffset;
     const sock = new WebSocket(url);
     tab.ws = sock;
     sock.binaryType = 'arraybuffer';
@@ -22,9 +23,18 @@ window.Connection = (function(){
     };
 
     sock.onmessage = e => {
+      if(tab.ws !== sock) return;             // late frame from a socket we already dropped
       if(typeof e.data === 'string'){
         try{
           const m = JSON.parse(e.data);
+          // Server announces where its replay starts. If that isn't where our
+          // screen left off, the replay would stack on top of what's already
+          // drawn (duplicated scrollback, garbled redraws), so start clean.
+          if(typeof m.offset === 'number'){
+            if(m.offset !== tab.recvOffset){ try{ tab.term.reset(); }catch{} }
+            tab.recvOffset = m.offset;
+            return;
+          }
           if(m.ptyExited){
             disconnect(tab);
             TabManager.removeStaleTab(tab);
@@ -45,6 +55,7 @@ window.Connection = (function(){
       }
       if(tab.restored) tab.restored = false;
       tab.reconnectFails = 0;
+      if(tab.recvOffset != null) tab.recvOffset += e.data.byteLength;
       const buf = tab.term.buffer.active;
       const wasNearBottom = (buf.baseY - buf.viewportY) <= 1;
       tab.term.write(new Uint8Array(e.data), () => { if(wasNearBottom) tab.term.scrollToBottom(); });
@@ -160,6 +171,7 @@ window.Connection = (function(){
     refreshTakeover(tab);
     remeasure(tab);
     try{ tab.term.reset(); }catch{}
+    tab.recvOffset = null;                    // screen wiped: ask for the full replay
     try{ tab.fitAddon.fit(); }catch{}
     tab.pendingJiggle = true;
     tab.reconnectDelay = 500;

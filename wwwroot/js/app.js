@@ -2,7 +2,7 @@
 
 (async function(){
   const ta = document.getElementById('ta');
-  let sentLen = 0;
+  let sent = '';   // text already typed into the PTY from #ta
   let composing = false;
 
   // Keyboard (text entry) toggle. When off, taps never refocus #ta, so the
@@ -21,10 +21,10 @@
     setInputEnabled(window.inputEnabled === false);
   });
 
-  // Expose sentLen for ButtonBar.resetTa
-  Object.defineProperty(window, 'sentLen', {
-    get(){ return sentLen; },
-    set(v){ sentLen = v; }
+  // Exposed for ButtonBar.resetTa and per-tab input save/restore
+  Object.defineProperty(window, 'sentText', {
+    get(){ return sent; },
+    set(v){ sent = v || ''; }
   });
 
   function sendActive(s){
@@ -32,13 +32,24 @@
     if(tab) Connection.send(tab, s);
   }
 
+  // Send only the change since the last send: DEL back to where the old and
+  // new text diverge, then type the new tail. DEL erases one character per
+  // press, so counts are in code points, not UTF-16 units.
   function rewrite(){
     const v = ta.value;
-    const out = '\x7f'.repeat(sentLen) + v;
+    let i = 0;
+    const n = Math.min(v.length, sent.length);
+    while(i < n && v.charCodeAt(i) === sent.charCodeAt(i)) i++;
+    if(i > 0 && i < sent.length && isLowSurrogate(sent.charCodeAt(i))) i--;   // don't split a pair
+    const dels = codePoints(sent.slice(i));
+    const out = '\x7f'.repeat(dels) + v.slice(i);
     if(out) sendActive(out);
-    sentLen = v.length;
+    sent = v;
   }
-  function resetTa(){ ta.value=''; sentLen=0; var t = TabManager.getActive(); if(t) t.term.scrollToBottom(); }
+  function isLowSurrogate(c){ return c >= 0xDC00 && c <= 0xDFFF; }
+  function codePoints(s){ let k = 0; for(const _ of s) k++; return k; }
+  function dropLast(s){ const a = Array.from(s); a.pop(); return a.join(''); }
+  function resetTa(){ ta.value=''; sent=''; var t = TabManager.getActive(); if(t) t.term.scrollToBottom(); }
 
   ta.addEventListener('compositionstart', ()=>{ composing = true; });
   ta.addEventListener('compositionend', ()=>{ composing = false; rewrite(); });
@@ -46,14 +57,14 @@
   // compositionend, leaving composing stuck true and every input ignored.
   ta.addEventListener('blur', ()=>{ composing = false; });
   window.resetInput = function(){
-    composing = false; ta.value = ''; sentLen = 0;
+    composing = false; ta.value = ''; sent = '';
     if(window.inputEnabled !== false) ta.focus();
   };
   ta.addEventListener('input', ()=>{ if(!composing) rewrite(); });
 
   ta.addEventListener('keydown', e => {
     const k = e.key;
-    if(k === 'Backspace'){ e.preventDefault(); sendActive('\x7f'); if(sentLen > 0) sentLen--; ta.value = ta.value.slice(0, -1); return; }
+    if(k === 'Backspace'){ e.preventDefault(); sendActive('\x7f'); sent = dropLast(sent); ta.value = dropLast(ta.value); return; }
     if(k === 'Enter'){ e.preventDefault(); sendActive('\r'); resetTa(); return; }
     if(k === 'Tab'){ e.preventDefault(); sendActive(e.shiftKey ? '\x1b[Z' : '\t'); resetTa(); return; }
     if(k === 'Delete'){ e.preventDefault(); sendActive('\x1b[3~'); resetTa(); return; }
@@ -93,6 +104,11 @@
     if(!t) return;
     t = t.replace(/\r\n?/g, '\n');
     sendActive('\x1b[200~' + t + '\x1b[201~');
+    // The paste bypasses #ta, so the PTY cursor now sits after it while #ta
+    // still mirrors only the text typed before. Any later DEL-based edit
+    // (autocorrect, rewrite diff) would erase Claude's [Pasted text]/[Image]
+    // placeholder — one DEL removes it whole. Start a fresh mirror instead.
+    ta.value = ''; sent = '';
   }
   // Native paste event (Ctrl+V, browser's own menu). clipboardData is granted
   // during a real paste gesture, so this never triggers the clipboard-read

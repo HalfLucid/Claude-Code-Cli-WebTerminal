@@ -61,6 +61,13 @@ window.TerminalManager = (function(){
     });
     const fitAddon = new FitAddon.FitAddon();
     term.loadAddon(fitAddon);
+    // Default Unicode 6 widths treat many symbols/emoji Claude prints as
+    // single-width while ConPTY draws them double-width, shifting the rest of
+    // the line one column. Unicode 11 matches ConPTY.
+    if(window.Unicode11Addon){
+      term.loadAddon(new Unicode11Addon.Unicode11Addon());
+      term.unicode.activeVersion = '11';
+    }
     term.open(containerEl);
     const coreEl = containerEl.querySelector('.xterm');
     if(coreEl){

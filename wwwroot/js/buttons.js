@@ -40,7 +40,7 @@ window.ButtonBar = (function(){
     var tab = TabManager.getActive();
     return tab ? tab.term : null;
   }
-  function resetTa(){ var ta = document.getElementById('ta'); ta.value=''; window.sentLen=0; var t = getActiveTerm(); if(t) t.scrollToBottom(); }
+  function resetTa(){ var ta = document.getElementById('ta'); ta.value=''; window.sentText=''; var t = getActiveTerm(); if(t) t.scrollToBottom(); }
 
   let expanded = false;
   let buttonOrder = null;

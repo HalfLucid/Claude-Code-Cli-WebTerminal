@@ -1023,7 +1023,10 @@ app.Map("/ws", async ctx =>
         Log($"SESSION NEW sid={sidShort}… from {ip}");
     else
         Log($"SESSION RECONNECT sid={sidShort}… from {ip}");
-    await session.Attach(ws, sm, sid, sidShort, ip, Log);
+    // Byte offset the client already holds; replay resumes there instead of
+    // re-sending output it has already rendered.
+    long? from = long.TryParse(ctx.Request.Query["from"].ToString(), out var f) ? f : null;
+    await session.Attach(ws, sm, sid, sidShort, ip, Log, from);
 });
 
 app.Lifetime.ApplicationStarted.Register(() =>
@@ -1277,11 +1280,12 @@ sealed class Session : IDisposable
         }
     }
 
-    public async Task Attach(WebSocket ws, SettingsManager sm, string sid, string sidShort, string ip, Action<string> log)
+    public async Task Attach(WebSocket ws, SettingsManager sm, string sid, string sidShort, string ip, Action<string> log, long? from = null)
     {
         WebSocket? old;
         Channel<byte[]>? oldCh;
-        byte[][] snapshot;
+        List<byte[]> snapshot = new();
+        long replayStart;
         Channel<byte[]> ch;
         lock (_lock)
         {
@@ -1290,7 +1294,16 @@ sealed class Session : IDisposable
             _current = ws;
             ch = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
             _channel = ch;
-            snapshot = _chunks.Select(c => c.data).ToArray();
+            // Resume from the client's offset when it's still inside the buffer;
+            // otherwise replay everything and the client wipes its screen first.
+            var oldest = _chunks.First?.Value.start ?? _totalBytes;
+            replayStart = from is long fr && fr >= oldest && fr <= _totalBytes ? fr : oldest;
+            foreach (var (start, data) in _chunks)
+            {
+                var end = start + data.Length;
+                if (end <= replayStart) continue;
+                snapshot.Add(start >= replayStart ? data : data[(int)(replayStart - start)..]);
+            }
         }
         oldCh?.Writer.TryComplete();
         if (old != null)
@@ -1302,6 +1315,8 @@ sealed class Session : IDisposable
 
         try
         {
+            var offsetMsg = Encoding.UTF8.GetBytes($"{{\"offset\":{replayStart}}}");
+            await ws.SendAsync(offsetMsg, WebSocketMessageType.Text, true, default);
             foreach (var c in snapshot)
                 await ws.SendAsync(c, WebSocketMessageType.Binary, true, default);
             if (!IsLaunched)

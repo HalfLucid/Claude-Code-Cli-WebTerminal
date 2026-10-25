@@ -19,7 +19,7 @@ ASP.NET Core minimal API (`Program.cs`) + static frontend (`wwwroot/`) that expo
 
 **Endpoints:**
 - `GET /` — serves `wwwroot/index.html` via `UseDefaultFiles` + `UseStaticFiles`
-- `Map /ws?sid=<guid>` — WebSocket upgrade; looks up or creates a `Session` keyed by `sid`
+- `Map /ws?sid=<guid>[&from=<offset>]` — WebSocket upgrade; looks up or creates a `Session` keyed by `sid`; `from` resumes replay at a byte offset (see Resumable replay)
 - `GET /api/settings` — returns projects, button config (no credentials)
 - `POST /api/projects` — add Claude project (name, directory, color)
 - `PUT /api/projects/{id}` — update project
@@ -53,6 +53,7 @@ Key pieces inside `Session`:
 - **Ring buffer**: `LinkedList<(long start, byte[] data)>` capped at `MaxBuffer = 256 KB`. `ReadLoop` reads from `Pty.ReaderStream`, appends to buffer, evicts oldest chunks, forwards via `TryWrite` to currently-attached channel.
 - **Per-attachment send pump**: each `Attach` creates a fresh `Channel<byte[]>`; pump reads it and calls `ws.SendAsync`. Avoids concurrent `SendAsync` calls.
 - **Replacement protocol**: second client with same sid closes old socket with `"replaced"`, replays ring buffer to new socket.
+- **Resumable replay**: the client tracks `tab.recvOffset` (absolute PTY byte offset it has rendered) and reconnects with `/ws?sid=<sid>&from=<offset>`. On attach the server first sends a `{"offset":N}` text frame, then replays from `N`: the client's offset if it is still inside the ring buffer, else the oldest buffered byte. If `N` differs from `tab.recvOffset` the client `term.reset()`s before the replay so output is never stacked twice. `hardRefresh` clears `recvOffset` to force a full replay.
 - **Metadata**: each session stores `Kind`, `Label`, `Color`, `ProjectId` — set during `Launch()` or from browser's launch JSON. Enables `GET /api/sessions` and MCP `list_tabs`.
 - **Reaper**: background task scans every minute, `Dispose()`s sessions idle 30+ minutes. Broadcasts `tab_closed` SSE event on reap.
 - **Launch**: `Launch(kind, projectId, settingsManager, sid)` — looks up project directory from settings. PowerShell sessions spawn via `powershell.exe`. Claude sessions spawn via `cmd.exe /K claude` (or `claude --resume`), with `WEBTERM_SID` and `WEBTERM_NOTIFY_TOKEN` environment variables injected for hook notifications.
@@ -63,7 +64,7 @@ Key pieces inside `Session`:
 - `index.html` — HTML shell with tab bar, terminal container, main screen, button overlay, modals
 - `css/style.css` — all styles
 - `js/settings.js` — API calls to `/api/settings`, `/api/projects`, `/api/buttons`
-- `js/terminal.js` — xterm.js instance factory (create/destroy per tab)
+- `js/terminal.js` — xterm.js instance factory (create/destroy per tab); loads the Unicode 11 addon so glyph widths match ConPTY
 - `js/connection.js` — per-tab WebSocket management, reconnect logic, resize
 - `js/buttons.js` — configurable button overlay with model/effort popouts
 - `js/tabs.js` — multi-tab state, tab bar rendering, `createExternalTab()` for server/MCP-initiated tabs
@@ -83,13 +84,13 @@ Key pieces inside `Session`:
 
 - **Binary frames** browser → server: written straight to `Pty.WriterStream`.
 - **Text frames** browser → server: parsed as JSON; `{launch, projectId, label, color}` triggers `Session.Launch` (label/color stored as metadata), `{cols, rows}` triggers `Pty.Resize`.
-- The hidden `#ta` textarea is the input source. It sends `\x7f` (DEL) once per previously-sent character before retransmitting the current value (see `rewrite()` in `app.js`). This is how mobile IME / autocorrect edits are reflected — preserve this contract if changing input handling.
+- The hidden `#ta` textarea is the input source. On each input it diffs the current value against the text already sent (`sentText`), sends one `\x7f` (DEL) per code point after the first difference, then sends the new tail (see `rewrite()` in `app.js`). Never retransmit the whole value per keystroke — that makes long input O(n) per key and forces Claude to redraw the whole prompt. This is how mobile IME / autocorrect edits are reflected — preserve this contract if changing input handling.
 - Special keys (Enter, Tab, Shift+Tab, Backspace, Delete, arrows, Home/End, PageUp/PageDown, Insert, Esc, Ctrl+letter) are intercepted in `keydown` and translated to raw escape sequences. Arrow, Home, and End keys support Ctrl and Shift modifier variants.
-- **Ctrl+C / Ctrl+V**: if text is selected in the terminal, Ctrl+C copies it (no SIGINT); Ctrl+V is a no-op in `keydown` and lets the native `paste` event on `#ta` fire instead, so `clipboardData` is read from the paste gesture itself (no clipboard-read permission chip). The right-click menu's Paste still calls `navigator.clipboard.readText()` since it has no paste gesture to hook. When nothing is selected, Ctrl+C sends raw ^C as usual. All pasted text is normalized to LF and wrapped in bracketed-paste (`\x1b[200~...\x1b[201~`) so a multi-line paste is treated as one block instead of submitting per line.
+- **Ctrl+C / Ctrl+V**: if text is selected in the terminal, Ctrl+C copies it (no SIGINT); Ctrl+V is a no-op in `keydown` and lets the native `paste` event on `#ta` fire instead, so `clipboardData` is read from the paste gesture itself (no clipboard-read permission chip). The right-click menu's Paste still calls `navigator.clipboard.readText()` since it has no paste gesture to hook. When nothing is selected, Ctrl+C sends raw ^C as usual. All pasted text is normalized to LF and wrapped in bracketed-paste (`\x1b[200~...\x1b[201~`) so a multi-line paste is treated as one block instead of submitting per line. A paste bypasses `#ta`, so afterwards `#ta`/`sentText` are cleared; otherwise a later DEL-based diff would erase Claude's `[Pasted text]`/`[Image]` placeholder.
 - **Right-click context menu**: xterm renders on canvas so the browser's native context menu has no Copy/Paste — a custom `.term-menu` overlay (in `terminal.js`) provides Copy and Paste items on right-click.
 - **Image paste / drag-drop**: the PTY is a keystroke stream, so image bytes can't be sent down it, and HTML5 drag-drop never exposes a real filesystem path. Pasting or dropping a file therefore POSTs the bytes to `/api/upload`, and the returned absolute host path is typed into the PTY (bracketed paste, quoted if it contains spaces) — the same thing a native terminal does when you drag a file onto it. Claude Code detects the image path and attaches it. `dragover`/`drop` are `preventDefault`ed on `document`; without that the browser navigates away to the dropped image.
 - **Upload directory**: `<project>\.webterm\uploads\` when the tab has a project, so the path is inside Claude's cwd and needs no Read approval. A self-ignoring `.webterm\.gitignore` (containing `*`) keeps the folder out of git. Tabs with no project (PowerShell) fall back to `%TEMP%\webterm-uploads\`. A background task sweeps files older than 24h, hourly.
-- **Tab input persistence**: switching tabs saves and restores textarea value and `sentLen`, so in-progress input survives tab switches.
+- **Tab input persistence**: switching tabs saves and restores textarea value and `sentText`, so in-progress input survives tab switches.
 
 ### Button overlay
 
