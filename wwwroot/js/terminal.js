@@ -80,6 +80,9 @@ window.TerminalManager = (function(){
         term.loadAddon(gl);
       }catch{}
     }
+    term.onWriteParsed(() => {
+      if(containerEl.classList.contains('active') && window.Connection) Connection.scheduleSlide();
+    });
     const coreEl = containerEl.querySelector('.xterm');
     if(coreEl){
       coreEl.addEventListener('contextmenu', e => {

@@ -291,10 +291,48 @@ window.Connection = (function(){
     let covered = document.documentElement.clientHeight - (vv.offsetTop + vv.height);
     if(Math.abs(vv.scale - 1) > 0.01) covered = 0;   // pinch-zoom, not a keyboard
     covered = Math.max(0, Math.round(covered));
-    terminals.style.transform = covered ? 'translateY(' + (-covered) + 'px)' : '';
+    let shift = covered;
+    if(covered){
+      const bottom = contentBottom(terminals);
+      if(bottom != null) shift = Math.min(covered, Math.max(0, Math.ceil(bottom - (terminals.offsetHeight - covered))));
+    }
+    terminals.style.transform = shift ? 'translateY(' + (-shift) + 'px)' : '';
     const offset = document.body.classList.contains('has-tabs') ? 37 : 0;
     document.getElementById('ta').style.height = (vv.height - offset) + 'px';
   }
 
-  return { connect, send, sendJson, sendSize, forceResize, hardRefresh, disconnect, reconnectIfNeeded, refreshTakeover, setBanner, applyViewportSize };
+  // Bottom edge (px from the top of #terminals) of the lowest visible row that
+  // holds text or the cursor, in the active tab. null if it can't be measured.
+  function contentBottom(terminals){
+    const tab = TabManager.getActive();
+    if(!tab || !tab.term) return null;
+    const term = tab.term, buf = term.buffer.active;
+    const screen = tab.containerEl.querySelector('.xterm-screen');
+    if(!screen) return null;
+    let cellH = 0;
+    try{ cellH = term._core._renderService.dimensions.css.cell.height; }catch{}
+    if(!cellH) return null;
+    let last = buf.cursorY + buf.baseY - buf.viewportY;   // cursor row within the viewport
+    for(let i = term.rows - 1; i > last; i--){
+      const line = buf.getLine(buf.viewportY + i);
+      if(line && line.translateToString(true).trim()){ last = i; break; }
+    }
+    if(last < 0 || last >= term.rows) last = term.rows - 1;   // cursor scrolled out of view
+    // Both rects carry the same transform, so their difference is unaffected.
+    const top = screen.getBoundingClientRect().top - terminals.getBoundingClientRect().top;
+    return top + (last + 1) * cellH;
+  }
+
+  let slideQueued = false;
+  function scheduleSlide(){
+    if(slideQueued || !keyboardCovers()) return;
+    slideQueued = true;
+    requestAnimationFrame(() => { slideQueued = false; applyViewportSize(); });
+  }
+  function keyboardCovers(){
+    const vv = window.visualViewport;
+    return !!vv && document.documentElement.clientHeight - (vv.offsetTop + vv.height) > 1;
+  }
+
+  return { connect, send, sendJson, sendSize, forceResize, hardRefresh, disconnect, reconnectIfNeeded, refreshTakeover, setBanner, applyViewportSize, scheduleSlide };
 })();
