@@ -5,21 +5,20 @@ window.Connection = (function(){
   function connect(tab){
     if(tab.ws && (tab.ws.readyState === 0 || tab.ws.readyState === 1)) return;
     tab.takenOver = false;
+    tab.replaying = false;                    // a socket dropped mid-replay never sends replayEnd
     let url = wsProto + location.host + '/ws?sid=' + encodeURIComponent(tab.sid);
-    if(tab.recvOffset != null) url += '&from=' + tab.recvOffset;
+    // Our grid size lets the server refuse the resume (and send a full replay)
+    // if the PTY was resized meanwhile; see Session.SizeUnchangedSince.
+    if(tab.recvOffset != null) url += '&from=' + tab.recvOffset + '&cols=' + tab.term.cols + '&rows=' + tab.term.rows;
     const sock = new WebSocket(url);
     tab.ws = sock;
     sock.binaryType = 'arraybuffer';
 
     sock.onopen = () => {
       tab.reconnectDelay = 500;
-      if(TabManager.getActive() === tab){
-        setBanner('');
-        sendSize(tab);
-      }
-      // Queued by hardRefresh. Sent on the new socket, so the server handles it
-      // after the ring-buffer replay and the repaint lands on top of it.
-      if(tab.pendingJiggle){ tab.pendingJiggle = false; jiggle(tab); }
+      if(TabManager.getActive() === tab) setBanner('');
+      // Size is sent on replayEnd, once the replay has been laid out at the
+      // sizes it was recorded at.
     };
 
     sock.onmessage = e => {
@@ -33,8 +32,14 @@ window.Connection = (function(){
           if(typeof m.offset === 'number'){
             if(m.offset !== tab.recvOffset){ try{ tab.term.reset(); }catch{} }
             tab.recvOffset = m.offset;
+            // Replay at the PTY size the bytes were produced at, switching in
+            // step with the {size} markers; our own size returns at replayEnd.
+            tab.replaying = true;
+            if(m.cols && m.rows) queueResize(tab, m.cols, m.rows);
             return;
           }
+          if(m.size){ queueResize(tab, m.size.cols, m.size.rows); return; }
+          if(m.replayEnd){ endReplay(tab, sock); return; }
           if(m.ptyExited){
             disconnect(tab);
             TabManager.removeStaleTab(tab);
@@ -70,6 +75,44 @@ window.Connection = (function(){
       scheduleReconnect(tab);
     };
     sock.onerror = () => { try { sock.close(); } catch{} };
+  }
+
+  // term.resize() applies immediately but term.write() is queued, so a resize
+  // must ride the write queue to land between the right bytes.
+  function queueResize(tab, cols, rows){
+    tab.term.write('', () => {
+      try{ if(cols !== tab.term.cols || rows !== tab.term.rows) tab.term.resize(cols, rows); }catch{}
+    });
+  }
+
+  function endReplay(tab, sock){
+    // Tell the server our size now, synchronously, so it precedes any launch
+    // message for a fresh session. Measured without touching xterm, which is
+    // still working through the replay at recorded sizes.
+    if(TabManager.getActive() === tab){
+      applyViewportSize();
+      let d = null;
+      try{ d = tab.fitAddon.proposeDimensions(); }catch{}
+      if(d && d.cols && d.rows){
+        tab.sentCols = d.cols; tab.sentRows = d.rows;
+        sendJson(tab, {cols: d.cols, rows: d.rows});
+      }
+    }
+    tab.term.write('', () => {
+      // The socket may have dropped and a new replay started while this one
+      // drained; that replay owns tab.replaying now.
+      if(tab.ws !== sock) return;
+      tab.replaying = false;
+      // forceResize fits it (and runs a pending repaint) on tab switch.
+      if(TabManager.getActive() !== tab) return;
+      sendSize(tab);
+      // Queued by hardRefresh: repaint on top of the finished replay.
+      runPendingJiggle(tab);
+    });
+  }
+
+  function runPendingJiggle(tab){
+    if(tab.pendingJiggle){ tab.pendingJiggle = false; jiggle(tab); }
   }
 
   function showTakeover(tab){
@@ -112,11 +155,16 @@ window.Connection = (function(){
     if(tab && tab.ws && tab.ws.readyState === 1) tab.ws.send(JSON.stringify(obj));
   }
 
-  function sendSize(tab){
-    if(!tab) return;
+  // Viewport resize events fire constantly on mobile (keyboard animation, URL
+  // bar). Only touch the PTY, and only yank the view to the bottom, when the
+  // grid actually changed — every real resize makes Claude reprint.
+  function sendSize(tab, force){
+    if(!tab || tab.replaying) return;         // endReplay sizes it once the replay is laid out
     applyViewportSize();
     try{ tab.fitAddon.fit(); }catch{ return; }
     const c = tab.term.cols, r = tab.term.rows;
+    if(!force && c === tab.sentCols && r === tab.sentRows) return;
+    tab.sentCols = c; tab.sentRows = r;
     tab.term.scrollToBottom();
     sendJson(tab, {cols:c, rows:r});
   }
@@ -129,13 +177,17 @@ window.Connection = (function(){
     if(!tab) return;
     remeasure(tab);
     requestAnimationFrame(() => {
+      if(tab.replaying) return;               // endReplay fits it when the replay is done
       try{ tab.fitAddon.fit(); }catch{ return; }
       requestAnimationFrame(() => {
+        if(tab.replaying) return;
         try{ tab.fitAddon.fit(); }catch{ return; }
         const c = tab.term.cols, r = tab.term.rows;
         try{ tab.term.refresh(0, r - 1); }catch{}
         tab.term.scrollToBottom();
+        tab.sentCols = c; tab.sentRows = r;
         sendJson(tab, {cols:c, rows:r});
+        runPendingJiggle(tab);                // reload whose replay finished while hidden
       });
     });
   }
@@ -229,15 +281,19 @@ window.Connection = (function(){
     else { banner.textContent = msg; banner.style.display='block'; }
   }
 
+  // Keyboard must never change the row count (see CLAUDE.md "Resize
+  // discipline"): keep the CSS height and slide up by the covered amount.
   function applyViewportSize(){
     const vv = window.visualViewport;
-    if(!vv) return;
-    const offset = document.body.classList.contains('has-tabs') ? 37 : 0;
-    const h = (vv.height - offset) + 'px';
     const terminals = document.getElementById('terminals');
-    const ta = document.getElementById('ta');
-    terminals.style.height = h;
-    ta.style.height = h;
+    terminals.style.height = '';
+    if(!vv){ terminals.style.transform = ''; return; }
+    let covered = document.documentElement.clientHeight - (vv.offsetTop + vv.height);
+    if(Math.abs(vv.scale - 1) > 0.01) covered = 0;   // pinch-zoom, not a keyboard
+    covered = Math.max(0, Math.round(covered));
+    terminals.style.transform = covered ? 'translateY(' + (-covered) + 'px)' : '';
+    const offset = document.body.classList.contains('has-tabs') ? 37 : 0;
+    document.getElementById('ta').style.height = (vv.height - offset) + 'px';
   }
 
   return { connect, send, sendJson, sendSize, forceResize, hardRefresh, disconnect, reconnectIfNeeded, refreshTakeover, setBanner, applyViewportSize };

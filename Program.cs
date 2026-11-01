@@ -732,7 +732,7 @@ app.MapPost("/mcp", async (HttpContext ctx) =>
                             ["kind"] = new { type = "string", description = "Session type", @enum = new[] { "powershell", "claude", "claude-resume" } },
                             ["projectId"] = new { type = "string", description = "Project ID (required for claude/claude-resume)" },
                             ["label"] = new { type = "string", description = "Tab label shown in browser" },
-                            ["command"] = new { type = "string", description = "Command to execute after launch" }
+                            ["command"] = new { type = "string", description = "kind=claude: the initial prompt, passed verbatim to Claude at launch and submitted immediately (multi-line and any characters are fine; max ~30000 chars). kind=powershell: a PowerShell command run at startup before the prompt appears (max ~12000 chars, since it is passed base64-encoded as UTF-16). Not supported for claude-resume." }
                         },
                         required = new[] { "kind" }
                     }),
@@ -827,6 +827,21 @@ object McpOpenTab(JsonElement? id, JsonElement args, string? callerSid)
     var projectId = args.TryGetProperty("projectId", out var p) ? p.GetString() : null;
     var label = args.TryGetProperty("label", out var l) ? l.GetString() : kind;
     var command = args.TryGetProperty("command", out var c) ? c.GetString() : null;
+
+    if (!string.IsNullOrEmpty(command))
+    {
+        string? problem =
+            kind == "claude-resume" ? "command (initial prompt) is not supported with kind=claude-resume; use kind=claude" :
+            kind == "claude" && Session.FindClaude() == null ? "claude not found on PATH (neither claude.exe nor an npm claude.cmd with node); cannot pass an initial prompt" :
+            Session.EncodedCommandLength(kind, command) > 32000 ? $"command ({command.Length} chars) exceeds the Windows command-line limit once encoded. Write longer instructions to a file and pass a short command/prompt that refers to it." :
+            null;
+        if (problem != null)
+            return McpResult(id, new
+            {
+                content = new[] { new { type = "text", text = problem } },
+                isError = true
+            });
+    }
 
     // Default to the calling Claude's own project when caller didn't specify one.
     // Caller sid arrives via the X-Webterm-Sid header (expanded from ${WEBTERM_SID} per session).
@@ -1026,7 +1041,9 @@ app.Map("/ws", async ctx =>
     // Byte offset the client already holds; replay resumes there instead of
     // re-sending output it has already rendered.
     long? from = long.TryParse(ctx.Request.Query["from"].ToString(), out var f) ? f : null;
-    await session.Attach(ws, sm, sid, sidShort, ip, Log, from);
+    int? fromCols = int.TryParse(ctx.Request.Query["cols"].ToString(), out var fc) ? fc : null;
+    int? fromRows = int.TryParse(ctx.Request.Query["rows"].ToString(), out var fr) ? fr : null;
+    await session.Attach(ws, sm, sid, sidShort, ip, Log, from, fromCols, fromRows);
 });
 
 app.Lifetime.ApplicationStarted.Register(() =>
@@ -1116,7 +1133,9 @@ static string ReadPassword()
 
 sealed class Session : IDisposable
 {
-    const int MaxBuffer = 256 * 1024;
+    // ~2 MB of ConPTY output is roughly what fills the client's 5000-line xterm
+    // scrollback for Claude (whose redraws and spinner are escape-heavy).
+    const int MaxBuffer = 2 * 1024 * 1024;
 
     public IPtyConnection? Pty { get; private set; }
     readonly object _lock = new();
@@ -1127,9 +1146,20 @@ sealed class Session : IDisposable
     DateTime _lastDetached = DateTime.UtcNow;
     bool _disposed;
     bool _ptyExited;
+    // Size to spawn the PTY at, set by resizes that arrive before launch.
+    // From launch on, the current size is _sizes[^1].
     int _cols = 120, _rows = 30;
+    // PTY size in effect from byte offset `at` onward. Output is laid out for
+    // the size it was produced at, so replay re-applies these in step with
+    // the bytes; replaying at the client's current size misplaces every
+    // cursor-positioned redraw. Pruned to the entries the ring buffer needs.
+    readonly List<(long at, int cols, int rows)> _sizes = new();
     bool _launched;
     readonly DateTime _createdAt = DateTime.Now;
+    // TEMP: one-off log when the ring buffer first fills, to size MaxBuffer from real data.
+    bool _bufferFullLogged;
+    Action<string>? _log;
+    string? _sidShort;
     int _inputCount;
     string? _kind;
     string? _label;
@@ -1171,26 +1201,44 @@ sealed class Session : IDisposable
             _launched = true;
             _kind ??= kind;
             _projectId ??= projectId;
+            _log = log;
+            _sidShort = sidShort;
+            RecordSize(_cols, _rows);
         }
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
         string app;
         string cwd;
         string[] cmd;
+        bool verbatim = false;
 
         if (kind == "powershell")
         {
             app = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
             cwd = home;
-            cmd = ["-NoProfile", "-NoLogo", "-NoExit"];
+            cmd = string.IsNullOrEmpty(defaultCommand)
+                ? ["-NoProfile", "-NoLogo", "-NoExit"]
+                // Base64 UTF-16LE: the command passes through with no quoting or escaping at all.
+                : ["-NoProfile", "-NoLogo", "-NoExit", "-EncodedCommand", EncodePowerShell(defaultCommand)];
         }
         else
         {
-            app = Path.Combine(Environment.SystemDirectory, "cmd.exe");
             var current = sm.Load();
             var project = current.Projects.FirstOrDefault(p => p.Id == projectId);
             cwd = project?.Directory ?? home;
-            cmd = kind == "claude-resume" ? ["/K", "claude", "--resume"] : ["/K", "claude"];
+            if (kind == "claude" && !string.IsNullOrEmpty(defaultCommand) && FindClaude() is { } claude)
+            {
+                // Spawned directly, not via cmd.exe /K, which re-parses % ^ & ", drops newlines and
+                // caps the line at 8191 chars. Verbatim because Porta.Pty's quoting mishandles \".
+                app = claude.App;
+                cmd = [string.Join(' ', [.. claude.Args, QuoteClaudePrompt(defaultCommand)])];
+                verbatim = true;
+            }
+            else
+            {
+                app = Path.Combine(Environment.SystemDirectory, "cmd.exe");
+                cmd = kind == "claude-resume" ? ["/K", "claude", "--resume"] : ["/K", "claude"];
+            }
         }
 
         log($"SESSION LAUNCH sid={sidShort}… kind={kind} cwd={cwd}");
@@ -1217,22 +1265,77 @@ sealed class Session : IDisposable
             Cwd = cwd,
             App = app,
             CommandLine = cmd,
+            VerbatimCommandLine = verbatim,
             Environment = env
         };
         Pty = PtyProvider.SpawnAsync(opts, CancellationToken.None).GetAwaiter().GetResult();
         _ = Task.Run(ReadLoop);
+    }
 
-        if (!string.IsNullOrEmpty(defaultCommand))
+    /// <summary>
+    /// How to spawn Claude directly (no cmd.exe): the native claude.exe, or for an npm install
+    /// (claude.cmd shim) node.exe + the package's cli.js, which is what the shim runs.
+    /// Args are already quoted for a verbatim command line. Null if neither is found on PATH.
+    /// </summary>
+    public static (string App, string[] Args)? FindClaude()
+    {
+        foreach (var dir in PathDirs())
         {
-            // Wait for the shell/TUI to boot its input loop before sending; an early send gets swallowed.
-            _ = Task.Run(async () =>
+            var exe = Path.Combine(dir, "claude.exe");
+            if (File.Exists(exe)) return (exe, []);
+            if (File.Exists(Path.Combine(dir, "claude.cmd")))
             {
-                await Task.Delay(6000);
-                var bytes = System.Text.Encoding.UTF8.GetBytes(defaultCommand + "\r");
-                await Pty.WriterStream.WriteAsync(bytes);
-                await Pty.WriterStream.FlushAsync();
-            });
+                var cli = Path.Combine(dir, "node_modules", "@anthropic-ai", "claude-code", "cli.js");
+                var localNode = Path.Combine(dir, "node.exe");
+                var node = File.Exists(localNode) ? localNode : FindOnPath("node.exe");
+                if (File.Exists(cli) && node != null) return (node, [QuoteWindowsArg(cli)]);
+            }
         }
+        return null;
+    }
+
+    static string? FindOnPath(string file) =>
+        PathDirs().Select(d => Path.Combine(d, file)).FirstOrDefault(File.Exists);
+
+    static IEnumerable<string> PathDirs()
+    {
+        foreach (var raw in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string dir;
+            try { dir = Path.GetFullPath(raw.Trim().Trim('"')); }
+            catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { continue; }
+            yield return dir;
+        }
+    }
+
+    static string EncodePowerShell(string command) =>
+        Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(command));
+
+    static string QuoteClaudePrompt(string prompt) =>
+        QuoteWindowsArg(prompt.StartsWith('-') ? " " + prompt : prompt);
+
+    /// <summary>Length the command adds to the spawned process's command line (Windows caps the whole line at 32767).</summary>
+    public static int EncodedCommandLength(string kind, string command) =>
+        kind == "powershell" ? EncodePowerShell(command).Length : QuoteClaudePrompt(command).Length;
+
+    /// <summary>
+    /// Quotes one argument so CommandLineToArgvW / the MSVC CRT parse it back byte-for-byte:
+    /// backslashes are literal except before a quote, where they are doubled and the quote is escaped.
+    /// </summary>
+    static string QuoteWindowsArg(string arg)
+    {
+        var sb = new System.Text.StringBuilder(arg.Length + 2).Append('"');
+        int backslashes = 0;
+        foreach (var ch in arg)
+        {
+            if (ch == '\\') { backslashes++; continue; }
+            if (ch == '"') sb.Append('\\', backslashes * 2 + 1);
+            else sb.Append('\\', backslashes);
+            sb.Append(ch);
+            backslashes = 0;
+        }
+        sb.Append('\\', backslashes * 2).Append('"');
+        return sb.ToString();
     }
 
     async Task ReadLoop()
@@ -1248,6 +1351,7 @@ sealed class Session : IDisposable
                 Buffer.BlockCopy(buf, 0, copy, 0, n);
 
                 Channel<byte[]>? ch;
+                string? fullMsg = null;
                 lock (_lock)
                 {
                     _chunks.AddLast((_totalBytes, copy));
@@ -1259,9 +1363,21 @@ sealed class Session : IDisposable
                         if (afterEvict >= MaxBuffer) _chunks.RemoveFirst();
                         else break;
                     }
+                    if (!_bufferFullLogged && _totalBytes >= MaxBuffer)
+                    {
+                        // TEMP: how much time / how many lines one buffer's worth covers.
+                        _bufferFullLogged = true;
+                        long newlines = 0, bytes = 0;
+                        foreach (var (_, d) in _chunks) { bytes += d.Length; newlines += d.AsSpan().Count((byte)'\n'); }
+                        fullMsg = $"BUFFER FULL sid={_sidShort}… kind={_kind} after {FormatDuration(DateTime.Now - _createdAt)}: {bytes / 1024} KB, {newlines} newlines buffered";
+                    }
+                    // Keep only the last size at-or-before the oldest byte, plus later ones.
+                    var oldestStart = _chunks.First!.Value.start;
+                    while (_sizes.Count > 1 && _sizes[1].at <= oldestStart) _sizes.RemoveAt(0);
                     ch = _channel;
                 }
                 ch?.Writer.TryWrite(copy);
+                if (fullMsg != null) _log?.Invoke(fullMsg);
             }
         }
         catch { }
@@ -1280,12 +1396,39 @@ sealed class Session : IDisposable
         }
     }
 
-    public async Task Attach(WebSocket ws, SettingsManager sm, string sid, string sidShort, string ip, Action<string> log, long? from = null)
+    // Call under _lock. Markers land on chunk boundaries because ReadLoop
+    // appends chunks under the same lock.
+    void RecordSize(int cols, int rows)
+    {
+        if (_sizes.Count > 0 && _sizes[^1].cols == cols && _sizes[^1].rows == rows) return;
+        if (_sizes.Count > 0 && _sizes[^1].at == _totalBytes) _sizes[^1] = (_totalBytes, cols, rows);
+        else _sizes.Add((_totalBytes, cols, rows));
+    }
+
+    // Call under _lock. True when every PTY size in effect from `at` onward is
+    // cols x rows. Unknown client size, or nothing recorded yet, counts as unchanged.
+    bool SizeUnchangedSince(long at, int? cols, int? rows)
+    {
+        if (cols is not int c || rows is not int r) return true;
+        for (var i = 0; i < _sizes.Count; i++)
+        {
+            var superseded = i + 1 < _sizes.Count && _sizes[i + 1].at <= at;
+            if (!superseded && (_sizes[i].cols != c || _sizes[i].rows != r)) return false;
+        }
+        return true;
+    }
+
+    static byte[] SizeFrame(int cols, int rows)
+        => Encoding.UTF8.GetBytes($"{{\"size\":{{\"cols\":{cols},\"rows\":{rows}}}}}");
+
+    public async Task Attach(WebSocket ws, SettingsManager sm, string sid, string sidShort, string ip, Action<string> log, long? from = null, int? fromCols = null, int? fromRows = null)
     {
         WebSocket? old;
         Channel<byte[]>? oldCh;
-        List<byte[]> snapshot = new();
+        // Replay frames in order: PTY bytes (binary) interleaved with size changes (text).
+        List<(bool text, byte[] payload)> snapshot = new();
         long replayStart;
+        int startCols, startRows;
         Channel<byte[]> ch;
         lock (_lock)
         {
@@ -1294,16 +1437,30 @@ sealed class Session : IDisposable
             _current = ws;
             ch = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
             _channel = ch;
-            // Resume from the client's offset when it's still inside the buffer;
-            // otherwise replay everything and the client wipes its screen first.
+            // Resume from the client's offset when it's still inside the buffer and
+            // the PTY stayed at the client's grid size from there on; otherwise
+            // replay everything and the client wipes its screen first. Resuming
+            // across a size change would make xterm reflow the screen it already
+            // has (rewrapped lines, rows pushed into scrollback).
             var oldest = _chunks.First?.Value.start ?? _totalBytes;
-            replayStart = from is long fr && fr >= oldest && fr <= _totalBytes ? fr : oldest;
+            replayStart = from is long fr && fr >= oldest && fr <= _totalBytes
+                          && SizeUnchangedSince(fr, fromCols, fromRows) ? fr : oldest;
+            if (from is long req && replayStart != req && req >= oldest && req <= _totalBytes)
+                log($"WS RESUME DECLINED sid={sidShort}… PTY size changed since offset {req}; full replay");
+            (startCols, startRows) = (0, 0);   // unlaunched: nothing recorded, client keeps its own size
+            var si = 0;
+            for (; si < _sizes.Count && _sizes[si].at <= replayStart; si++)
+                (startCols, startRows) = (_sizes[si].cols, _sizes[si].rows);
             foreach (var (start, data) in _chunks)
             {
                 var end = start + data.Length;
                 if (end <= replayStart) continue;
-                snapshot.Add(start >= replayStart ? data : data[(int)(replayStart - start)..]);
+                for (; si < _sizes.Count && _sizes[si].at <= start; si++)
+                    snapshot.Add((true, SizeFrame(_sizes[si].cols, _sizes[si].rows)));
+                snapshot.Add((false, start >= replayStart ? data : data[(int)(replayStart - start)..]));
             }
+            for (; si < _sizes.Count; si++)
+                snapshot.Add((true, SizeFrame(_sizes[si].cols, _sizes[si].rows)));
         }
         oldCh?.Writer.TryComplete();
         if (old != null)
@@ -1315,10 +1472,12 @@ sealed class Session : IDisposable
 
         try
         {
-            var offsetMsg = Encoding.UTF8.GetBytes($"{{\"offset\":{replayStart}}}");
+            var offsetMsg = Encoding.UTF8.GetBytes($"{{\"offset\":{replayStart},\"cols\":{startCols},\"rows\":{startRows}}}");
             await ws.SendAsync(offsetMsg, WebSocketMessageType.Text, true, default);
-            foreach (var c in snapshot)
-                await ws.SendAsync(c, WebSocketMessageType.Binary, true, default);
+            foreach (var (text, payload) in snapshot)
+                await ws.SendAsync(payload, text ? WebSocketMessageType.Text : WebSocketMessageType.Binary, true, default);
+            var endMsg = Encoding.UTF8.GetBytes("{\"replayEnd\":true}");
+            await ws.SendAsync(endMsg, WebSocketMessageType.Text, true, default);
             if (!IsLaunched)
             {
                 var msg = Encoding.UTF8.GetBytes("{\"choose\":true}");
@@ -1378,7 +1537,7 @@ sealed class Session : IDisposable
                         else if (root.TryGetProperty("cols", out var c) && root.TryGetProperty("rows", out var rr))
                         {
                             var ci = c.GetInt32(); var ri = rr.GetInt32();
-                            lock (_lock) { _cols = ci; _rows = ri; }
+                            lock (_lock) { if (_launched) RecordSize(ci, ri); else (_cols, _rows) = (ci, ri); }
                             Pty?.Resize(ci, ri);
                         }
                     }

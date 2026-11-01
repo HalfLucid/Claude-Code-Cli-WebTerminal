@@ -240,7 +240,12 @@
   }, 100); }
   window.addEventListener('resize', scheduleResize);
   window.addEventListener('orientationchange', () => setTimeout(scheduleResize, 300));
-  if(window.visualViewport) window.visualViewport.addEventListener('resize', scheduleResize);
+  if(window.visualViewport){
+    window.visualViewport.addEventListener('resize', scheduleResize);
+    // iOS pans the visual viewport (offsetTop changes) with only a 'scroll'
+    // event; re-slide the terminal. Layout only, never a PTY resize.
+    window.visualViewport.addEventListener('scroll', () => Connection.applyViewportSize());
+  }
   if(window.screen && screen.orientation) screen.orientation.addEventListener('change', () => setTimeout(scheduleResize, 300));
 
   // Notification permission

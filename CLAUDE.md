@@ -19,7 +19,7 @@ ASP.NET Core minimal API (`Program.cs`) + static frontend (`wwwroot/`) that expo
 
 **Endpoints:**
 - `GET /` — serves `wwwroot/index.html` via `UseDefaultFiles` + `UseStaticFiles`
-- `Map /ws?sid=<guid>[&from=<offset>]` — WebSocket upgrade; looks up or creates a `Session` keyed by `sid`; `from` resumes replay at a byte offset (see Resumable replay)
+- `Map /ws?sid=<guid>[&from=<offset>&cols=<c>&rows=<r>]` — WebSocket upgrade; looks up or creates a `Session` keyed by `sid`; `from` resumes replay at a byte offset, `cols`/`rows` are the client's grid (see Resumable replay)
 - `GET /api/settings` — returns projects, button config (no credentials)
 - `POST /api/projects` — add Claude project (name, directory, color)
 - `PUT /api/projects/{id}` — update project
@@ -50,10 +50,11 @@ JSON with: `credentials` (DPAPI-encrypted), `projects` (array of {id, name, dire
 
 Key pieces inside `Session`:
 
-- **Ring buffer**: `LinkedList<(long start, byte[] data)>` capped at `MaxBuffer = 256 KB`. `ReadLoop` reads from `Pty.ReaderStream`, appends to buffer, evicts oldest chunks, forwards via `TryWrite` to currently-attached channel.
+- **Ring buffer**: `LinkedList<(long start, byte[] data)>` capped at `MaxBuffer = 2 MB` (≈ the client's 5000-line xterm scrollback of escape-heavy Claude output). `ReadLoop` reads from `Pty.ReaderStream`, appends to buffer, evicts oldest chunks, forwards via `TryWrite` to currently-attached channel.
 - **Per-attachment send pump**: each `Attach` creates a fresh `Channel<byte[]>`; pump reads it and calls `ws.SendAsync`. Avoids concurrent `SendAsync` calls.
 - **Replacement protocol**: second client with same sid closes old socket with `"replaced"`, replays ring buffer to new socket.
-- **Resumable replay**: the client tracks `tab.recvOffset` (absolute PTY byte offset it has rendered) and reconnects with `/ws?sid=<sid>&from=<offset>`. On attach the server first sends a `{"offset":N}` text frame, then replays from `N`: the client's offset if it is still inside the ring buffer, else the oldest buffered byte. If `N` differs from `tab.recvOffset` the client `term.reset()`s before the replay so output is never stacked twice. `hardRefresh` clears `recvOffset` to force a full replay.
+- **Resumable replay**: the client tracks `tab.recvOffset` (absolute PTY byte offset it has rendered) and reconnects with `/ws?sid=<sid>&from=<offset>&cols=<c>&rows=<r>`. On attach the server first sends a `{"offset":N}` text frame, then replays from `N`: the client's offset if it is still inside the ring buffer **and** the PTY size stayed at the client's `cols`×`rows` from there on (`SizeUnchangedSince`; otherwise xterm would reflow the screen it already has), else the oldest buffered byte. If `N` differs from `tab.recvOffset` the client `term.reset()`s before the replay so output is never stacked twice. `hardRefresh` clears `recvOffset` to force a full replay.
+- **Size-faithful replay**: output is laid out for the PTY size it was produced at, so `Session._sizes` records `(offset, cols, rows)` on launch and on every resize (pruned alongside the ring buffer). The offset frame carries the size in effect at `N` (`{"offset":N,"cols":c,"rows":r}`; 0 when unlaunched), `{"size":{cols,rows}}` text frames are interleaved with the replay bytes at the offsets where the size changed, and `{"replayEnd":true}` closes it. The client applies each size via `queueResize` (a `term.write('', cb)` so the resize lands between the right bytes, since `term.resize` is synchronous but writes are queued). On `replayEnd` it sends its own size to the server immediately (via `proposeDimensions`, so it precedes any launch message), then fits xterm back to its container once the replay has drained. `tab.replaying` blocks `sendSize`/`forceResize` meanwhile.
 - **Metadata**: each session stores `Kind`, `Label`, `Color`, `ProjectId` — set during `Launch()` or from browser's launch JSON. Enables `GET /api/sessions` and MCP `list_tabs`.
 - **Reaper**: background task scans every minute, `Dispose()`s sessions idle 30+ minutes. Broadcasts `tab_closed` SSE event on reap.
 - **Launch**: `Launch(kind, projectId, settingsManager, sid)` — looks up project directory from settings. PowerShell sessions spawn via `powershell.exe`. Claude sessions spawn via `cmd.exe /K claude` (or `claude --resume`), with `WEBTERM_SID` and `WEBTERM_NOTIFY_TOKEN` environment variables injected for hook notifications.
@@ -64,7 +65,7 @@ Key pieces inside `Session`:
 - `index.html` — HTML shell with tab bar, terminal container, main screen, button overlay, modals
 - `css/style.css` — all styles
 - `js/settings.js` — API calls to `/api/settings`, `/api/projects`, `/api/buttons`
-- `js/terminal.js` — xterm.js instance factory (create/destroy per tab); loads the Unicode 11 addon so glyph widths match ConPTY
+- `js/terminal.js` — xterm.js instance factory (create/destroy per tab); loads the Unicode 11 addon so glyph widths match ConPTY, and the WebGL renderer (grid-locked glyphs; falls back to DOM on context loss)
 - `js/connection.js` — per-tab WebSocket management, reconnect logic, resize
 - `js/buttons.js` — configurable button overlay with model/effort popouts
 - `js/tabs.js` — multi-tab state, tab bar rendering, `createExternalTab()` for server/MCP-initiated tabs
@@ -77,6 +78,8 @@ Key pieces inside `Session`:
 - Real-time updates via SSE (`/api/events`): `tab_opened` creates tab, `tab_closed` removes tab, `tab_attention` / `tab_idle` trigger attention indicators
 - Cross-device: any browser connecting sees all active sessions. Second device connecting to same sid replaces first (existing replacement protocol).
 - `createExternalTab(sid, kind, projectId, label, color)` — creates tab for server-side session, sets `restored: true` so stale sessions auto-remove
+
+**Resize discipline:** every real PTY resize makes ConPTY repaint and Claude reprint its transcript, which stacks duplicate paragraphs in xterm's scrollback. So the mobile keyboard must never change the row count: `applyViewportSize()` keeps `#terminals` at its CSS (layout-viewport) height and `translateY`s it up by the keyboard-covered amount. `sendSize()` only sends `{cols, rows}` (and scrolls to bottom) when the grid actually changed. On connect the size is sent at `replayEnd`, not on socket open.
 
 **Main screen:** Full-page launcher (replaces old chooser modal). Shows PowerShell button + Claude project list from settings. Each project has "Open Claude" and "Resume Claude" buttons. Add/edit/delete projects via modal.
 
@@ -124,7 +127,10 @@ Global middleware enforces HTTP Basic auth. Credentials are set on first run (co
 ### MCP Server
 
 WebTerm exposes an MCP (Model Context Protocol) server at `POST /mcp?token=<key>`. JSON-RPC 2.0, Streamable HTTP transport. Tools:
-- `open_tab(kind, projectId?, label?, command?)` — creates session, launches PTY, broadcasts SSE event. If `projectId` is omitted, defaults to the calling Claude session's own project (resolved via `X-Webterm-Sid` header).
+- `open_tab(kind, projectId?, label?, command?)` — creates session, launches PTY, broadcasts SSE event. If `projectId` is omitted, defaults to the calling Claude session's own project (resolved via `X-Webterm-Sid` header). `command` is handed to the process at spawn time, never typed into the PTY (typing it after a delay raced startup and arrived mangled):
+  - `kind=claude`: the initial prompt. `claude.exe` (found on PATH; for an npm install, `node.exe` + the package's `cli.js` behind the `claude.cmd` shim) is spawned **directly**, not via `cmd.exe /K`, because cmd re-parses `% ^ & "`, can't carry newlines and caps the line at 8191 chars. The tab therefore closes when Claude exits. Porta.Pty's built-in quoting mishandles backslash-before-quote, so the line is built with `VerbatimCommandLine = true` and `QuoteWindowsArg` (MSVC rules). A prompt starting with `-` gets a leading space so it isn't parsed as an option.
+  - `kind=powershell`: passed as `-NoExit -EncodedCommand <base64 UTF-16LE>` (no escaping needed). The browser's "Add MCP" tab uses the same path via `defaultCommand`.
+  - `kind=claude-resume`: rejected. Also rejected if the encoded command would exceed the Windows command-line limit (~32K).
 - `close_tab(sid)` — disposes session, broadcasts SSE event
 - `list_tabs()` — returns all active sessions with metadata
 - `restart()` — rebuilds and restarts the WebTerm server, killing all sessions

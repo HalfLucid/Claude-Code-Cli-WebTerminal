@@ -69,6 +69,17 @@ window.TerminalManager = (function(){
       term.unicode.activeVersion = '11';
     }
     term.open(containerEl);
+    // WebGL draws every glyph into a fixed cell. The default DOM renderer lays
+    // out text runs, so fallback-font symbols drift off the grid on mobile and
+    // fast touch-scrolls can flash stale rows. Browsers cap live GL contexts
+    // (fewer on phones); a tab that loses its context drops back to DOM.
+    if(window.WebglAddon){
+      try{
+        const gl = new WebglAddon.WebglAddon();
+        gl.onContextLoss(() => { try{ gl.dispose(); }catch{} });
+        term.loadAddon(gl);
+      }catch{}
+    }
     const coreEl = containerEl.querySelector('.xterm');
     if(coreEl){
       coreEl.addEventListener('contextmenu', e => {
