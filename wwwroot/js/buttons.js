@@ -42,6 +42,57 @@ window.ButtonBar = (function(){
   }
   function resetTa(){ var ta = document.getElementById('ta'); ta.value=''; window.sentText=''; var t = getActiveTerm(); if(t) t.scrollToBottom(); }
 
+  // Claude Code's assistant bullet is ● on Windows/Linux, ⏺ on macOS.
+  const BULLET = /^[●⏺] /;
+  const TOOL_HEADER = /^[●⏺] [\w.:-]+(?: - [\w.:-]+)?(?: \(MCP\))?\(/;
+  function lineText(buf, y){ const l = buf.getLine(y); return l ? l.translateToString(true) : ''; }
+  function isResponseStart(buf, y){
+    const l = buf.getLine(y);
+    if(!l || l.isWrapped) return false;
+    const s = l.translateToString(true);
+    if(!BULLET.test(s) || TOOL_HEADER.test(s) || s.includes('(ctrl+o to expand)')) return false;
+    for(let i = y + 1; i <= y + 4 && i < buf.length; i++){
+      const n = lineText(buf, i).trim();
+      if(n) return !n.startsWith('⎿');
+    }
+    return true;
+  }
+  // Jump targets land one line below the viewport top (one line of context above).
+  function jumpToResponse(dir){
+    const t = getActiveTerm();
+    if(!t) return false;
+    const buf = t.buffer.active;
+    const top = buf.viewportY;
+    if(dir < 0){
+      for(let y = Math.min(top, buf.length - 1); y >= 0; y--){
+        if(isResponseStart(buf, y)){ t.scrollToLine(Math.max(0, y - 1)); return true; }
+      }
+      return false;
+    }
+    for(let y = top + 2; y < buf.length; y++){
+      if(y - 1 > buf.baseY) break;           // already on the last screen
+      if(isResponseStart(buf, y)){ t.scrollToLine(y - 1); return true; }
+    }
+    t.scrollToBottom();
+    return true;
+  }
+  function jumpBtn(dir){
+    const el = makeBtn('jump', dir < 0 ? '&#9679;&#8593;' : '&#9679;&#8595;', () => {
+      if(!jumpToResponse(dir)){ el.classList.add('nomatch'); setTimeout(() => el.classList.remove('nomatch'), 400); }
+    });
+    el.title = dir < 0 ? 'Previous Claude response' : 'Next Claude response';
+    return el;
+  }
+  // Devtools aid: lists every bullet line and whether it counts as a response start.
+  window.webtermBullets = function(){
+    const t = getActiveTerm(); if(!t) return;
+    const buf = t.buffer.active;
+    for(let y = 0; y < buf.length; y++){
+      const s = lineText(buf, y);
+      if(/^\s*[●⏺]/.test(s)) console.log(y, isResponseStart(buf, y) ? 'RESP' : 'skip', JSON.stringify(s.slice(0, 80)));
+    }
+  };
+
   let expanded = false;
   let buttonOrder = null;
   let customButtons = [];
@@ -84,7 +135,16 @@ window.ButtonBar = (function(){
       btoggle.innerHTML = '&#8595;';
       for(const key of Object.keys(BUILTIN_BUTTONS)){
         const b = BUILTIN_BUTTONS[key];
-        if(b.minimizedOnly) blist.appendChild(makeBtn('', b.label, b.fn));
+        if(!b.minimizedOnly) continue;
+        if(key === 'scroll-up' || key === 'scroll-down'){
+          const row = document.createElement('div');
+          row.className = 'brow';
+          row.appendChild(jumpBtn(key === 'scroll-up' ? -1 : 1));
+          row.appendChild(makeBtn('', b.label, b.fn));
+          blist.appendChild(row);
+        } else {
+          blist.appendChild(makeBtn('', b.label, b.fn));
+        }
       }
       return;
     }

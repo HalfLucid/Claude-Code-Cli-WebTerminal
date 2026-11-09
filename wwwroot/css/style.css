@@ -38,6 +38,9 @@ body.has-tabs .btnbar{top:calc(env(safe-area-inset-top,0px) + 69px)}
 .btn{background:#2a3340;color:#bde;border:1px solid #4a6680;border-radius:8px;padding:10px 12px;min-width:56px;font:bold 18px monospace;opacity:0.55;transition:opacity .15s;-webkit-tap-highlight-color:transparent;touch-action:manipulation;text-align:center;cursor:pointer}
 .btn:hover,.btn:active{opacity:0.95}
 .btn.nav{background:#402a3a;color:#fbd;border-color:#80506a}
+.brow{display:flex;gap:6px}
+.btn.jump{min-width:0;padding:10px 8px;font-size:15px}
+.btn.jump.nomatch{border-color:#f85149;opacity:0.95}
 #kbtoggle.off{background:#1a1f26;color:#667;border-color:#334;text-decoration:line-through}
 .pager{display:flex;gap:6px;justify-content:center}
 .pager-btn{min-width:40px;padding:8px 10px;font-size:12px}

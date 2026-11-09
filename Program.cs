@@ -1163,9 +1163,13 @@ sealed class Session : IDisposable
         public readonly Channel<(bool text, byte[] payload)> Ch =
             Channel.CreateUnbounded<(bool text, byte[] payload)>(new UnboundedChannelOptions { SingleReader = true });
         // Armed when the attachment ends; aborts the socket if the pump or the
-        // close handshake is still stuck. Not disposed: CancelAfter may still be
-        // called after Attach returns, and an abort on a closed socket is a no-op.
+        // close handshake is still stuck. The CTS is not disposed (CancelAfter
+        // may still be called after Attach returns), but its abort callback is
+        // unregistered by Disarm before Attach returns: once the request ends,
+        // ASP.NET disposes the HttpContext, and aborting the socket then throws
+        // ObjectDisposedException on the timer thread, which kills the process.
         public readonly CancellationTokenSource Deadline = new();
+        readonly CancellationTokenRegistration _abortReg;
         // Written under the session lock but read lock-free by the pump, so it
         // is published with Volatile.Write after CloseReason.
         public bool Ended;
@@ -1186,8 +1190,19 @@ sealed class Session : IDisposable
         public Attachment(WebSocket ws)
         {
             Ws = ws;
-            Deadline.Token.Register(ws.Abort);
+            _abortReg = Deadline.Token.Register(() => SafeAbort(ws));
         }
+
+        // Call before Attach returns. Blocks until a callback already running
+        // finishes, so none can run after the HttpContext is gone.
+        public void Disarm() => _abortReg.Dispose();
+    }
+
+    // Abort callbacks run on timer threads, where an exception is unhandled
+    // and terminates the process.
+    static void SafeAbort(WebSocket ws)
+    {
+        try { ws.Abort(); } catch { }
     }
 
     Attachment? _att;
@@ -1448,7 +1463,7 @@ sealed class Session : IDisposable
     {
         var ws = a.Ws;
         using var stall = new CancellationTokenSource();
-        using var reg = stall.Token.Register(ws.Abort);
+        using var reg = stall.Token.Register(() => SafeAbort(ws));
         try
         {
             await foreach (var (text, payload) in a.Ch.Reader.ReadAllAsync())
@@ -1677,6 +1692,9 @@ sealed class Session : IDisposable
             }
             log($"WS DISCONNECTED sid={sidShort}… from {ip} ({Stats})");
             try { await sendPump; } catch { }
+            // The receive loop and pump are done, so nothing needs the abort
+            // any more; disarm it before the request (and HttpContext) ends.
+            a.Disarm();
         }
     }
 
