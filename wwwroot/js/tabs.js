@@ -25,7 +25,9 @@ window.TabManager = (function(){
       ws: null,
       reconnectDelay: 500,
       reconnectTimer: null,
-      bornAt: Date.now()   // grace window: server registers session only once WS connects
+      // /api/sessions lists a session only once its launch is processed, so
+      // until the server confirms it, absence from that list proves nothing.
+      confirmed: false
     };
 
     tabs.push(tab);
@@ -51,7 +53,8 @@ window.TabManager = (function(){
       ws: null,
       reconnectDelay: 500,
       reconnectTimer: null,
-      restored: true
+      restored: true,
+      confirmed: true
     };
 
     tabs.push(tab);
@@ -93,43 +96,41 @@ window.TabManager = (function(){
 
   async function closeTab(index){
     if(index < 0 || index >= tabs.length) return;
-    if(!await Dialog.confirm('Close "' + tabs[index].label + '" session?')) return;
-
+    // Hold the tab, not the index: the list can change while the dialog is up
+    // (SSE tab_closed, reconcile), and removeTab ignores a tab already gone.
     const tab = tabs[index];
-    fetch('/api/sessions/' + encodeURIComponent(tab.sid), { method: 'DELETE' }).catch(() => {});
-    Connection.disconnect(tab);
-    TerminalManager.destroyTerminal(tab.term, tab.containerEl);
-    tabs.splice(index, 1);
-
-    if(tabs.length === 0){
-      activeIndex = -1;
-      document.body.classList.remove('has-tabs');
-      showMainScreen();
-    } else {
-      const newIndex = index >= tabs.length ? tabs.length - 1 : index;
-      activeIndex = -1;
-      switchTo(newIndex);
-    }
-    renderTabBar();
-    saveTabs();
+    if(!await Dialog.confirm('Close "' + tab.label + '" session?')) return;
+    if(!tabs.includes(tab)) return;
+    removeTab(tab, true);
   }
 
-  function removeStaleTab(tab){
+  // Drops the tab from this browser. The server session (and its PTY) is
+  // killed only when deleteSession is set: the user closed it, or it is
+  // certainly dead/junk. Anything inferred from a guess must leave it alone,
+  // so it stays resumable from here or another device.
+  function removeTab(tab, deleteSession){
     const index = tabs.indexOf(tab);
     if(index < 0) return;
-    fetch('/api/sessions/' + encodeURIComponent(tab.sid), { method: 'DELETE' }).catch(() => {});
+    if(deleteSession) fetch('/api/sessions/' + encodeURIComponent(tab.sid), { method: 'DELETE' }).catch(() => {});
     Connection.disconnect(tab);
     TerminalManager.destroyTerminal(tab.term, tab.containerEl);
     tabs.splice(index, 1);
+    const wasActive = index === activeIndex;
 
     if(tabs.length === 0){
       activeIndex = -1;
       document.body.classList.remove('has-tabs');
       showMainScreen();
-    } else {
+    } else if(wasActive){
       const newIndex = index >= tabs.length ? tabs.length - 1 : index;
+      // -1 so switchTo doesn't save the removed tab's #ta input onto another tab.
       activeIndex = -1;
       switchTo(newIndex);
+    } else if(index < activeIndex){
+      // A background tab went away (reconcile, SSE, reconnect failure): keep
+      // the user where they are. Only the index shifts; no switch, so #ta and
+      // the PTY size are left alone.
+      activeIndex--;
     }
     renderTabBar();
     saveTabs();
@@ -240,7 +241,8 @@ window.TabManager = (function(){
       ws: null,
       reconnectDelay: 500,
       reconnectTimer: null,
-      restored: true
+      restored: true,
+      confirmed: true                         // the server told us about it
     };
 
     tabs.push(tab);
@@ -264,7 +266,7 @@ window.TabManager = (function(){
   }
 
   return {
-    createTab, createExternalTab, restoreTab, switchTo, closeTab, removeStaleTab,
+    createTab, createExternalTab, restoreTab, switchTo, closeTab, removeTab,
     renderTabBar, getActive, getAll,
     showMainScreen, hideMainScreen,
     loadSavedTabs, getSavedActiveIndex, migrateOldSid,

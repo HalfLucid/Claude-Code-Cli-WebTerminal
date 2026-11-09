@@ -300,14 +300,16 @@
     } catch { return; }              // network blip — keep current tabs
 
     const serverSids = new Set(serverSessions.map(s => s.sid));
+    TabManager.getAll().forEach(t => { if(serverSids.has(t.sid)) t.confirmed = true; });
 
     // Drop local tabs the server no longer has (capture refs first — indices shift).
-    // Skip tabs born <8s ago: their session registers only once the WS connects,
-    // so a freshly-created local tab may legitimately not be in /api/sessions yet.
-    const now = Date.now();
+    // Unconfirmed tabs are skipped: the server lists a session only after its
+    // launch is processed, which on a slow link can take arbitrarily long.
+    // Removal is local only; a DELETE here could kill a session we merely
+    // haven't seen yet.
     TabManager.getAll()
-      .filter(t => !serverSids.has(t.sid) && !(t.bornAt && now - t.bornAt < 8000))
-      .forEach(t => TabManager.removeStaleTab(t));
+      .filter(t => t.confirmed && !serverSids.has(t.sid))
+      .forEach(t => TabManager.removeTab(t, false));
 
     // Add server sessions missing locally.
     const localSids = new Set(TabManager.getAll().map(t => t.sid));
@@ -574,7 +576,7 @@
     es.addEventListener('tab_closed', function(e){
       var data = JSON.parse(e.data);
       var tab = TabManager.getAll().find(function(t){ return t.sid === data.sid; });
-      if(tab) TabManager.removeStaleTab(tab);
+      if(tab) TabManager.removeTab(tab, false);   // server already disposed it
     });
     es.addEventListener('tab_attention', function(e){
       var data = JSON.parse(e.data);

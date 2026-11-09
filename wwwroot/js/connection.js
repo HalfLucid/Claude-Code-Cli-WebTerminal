@@ -4,6 +4,8 @@ window.Connection = (function(){
 
   function connect(tab){
     if(tab.ws && (tab.ws.readyState === 0 || tab.ws.readyState === 1)) return;
+    stopHeartbeat(tab);
+    clearConnectTimer(tab);
     tab.takenOver = false;
     tab.replaying = false;                    // a socket dropped mid-replay never sends replayEnd
     let url = wsProto + location.host + '/ws?sid=' + encodeURIComponent(tab.sid);
@@ -13,42 +15,72 @@ window.Connection = (function(){
     const sock = new WebSocket(url);
     tab.ws = sock;
     sock.binaryType = 'arraybuffer';
+    // After a network switch a socket can sit in CONNECTING for minutes, and
+    // the heartbeat only covers open sockets. Give up and retry instead.
+    tab.connectTimer = setTimeout(() => {
+      tab.connectTimer = null;
+      if(tab.ws === sock && sock.readyState === 0) declareDead(tab, sock);
+    }, CONNECT_TIMEOUT);
 
     sock.onopen = () => {
+      clearConnectTimer(tab);
       tab.reconnectDelay = 500;
       if(TabManager.getActive() === tab) setBanner('');
       // Size is sent on replayEnd, once the replay has been laid out at the
       // sizes it was recorded at.
+      startHeartbeat(tab, sock);
     };
 
     sock.onmessage = e => {
       if(tab.ws !== sock) return;             // late frame from a socket we already dropped
+      tab.lastRecv = Date.now();              // any frame (replay included) proves the socket alive
       if(typeof e.data === 'string'){
         try{
           const m = JSON.parse(e.data);
+          if(m.pong !== undefined) return;
           // Server announces where its replay starts. If that isn't where our
           // screen left off, the replay would stack on top of what's already
           // drawn (duplicated scrollback, garbled redraws), so start clean.
           if(typeof m.offset === 'number'){
-            if(m.offset !== tab.recvOffset){ try{ tab.term.reset(); }catch{} }
+            // The server's first frame on attach: this reconnect worked, even
+            // if an idle session sends no output to reset the count below.
+            tab.reconnectFails = 0;
+            // Queued ahead of the size below and the replay bytes.
+            if(m.offset !== tab.recvOffset) queueReset(tab);
             tab.recvOffset = m.offset;
+            // A size is only recorded once the PTY launched, so the server
+            // has this session and will list it.
+            if(m.cols && m.rows) tab.confirmed = true;
             // Replay at the PTY size the bytes were produced at, switching in
             // step with the {size} markers; our own size returns at replayEnd.
             tab.replaying = true;
+            tab.replayTruncated = !!m.truncated;
+            tab.replayCols = m.cols; tab.replayRows = m.rows;
             if(m.cols && m.rows) queueResize(tab, m.cols, m.rows);
             return;
           }
-          if(m.size){ queueResize(tab, m.size.cols, m.size.rows); return; }
+          if(m.size){
+            tab.replayCols = m.size.cols; tab.replayRows = m.size.rows;
+            queueResize(tab, m.size.cols, m.size.rows);
+            return;
+          }
           if(m.replayEnd){ endReplay(tab, sock); return; }
           if(m.ptyExited){
+            // The process is gone; deleting just frees the dead session.
             disconnect(tab);
-            TabManager.removeStaleTab(tab);
+            TabManager.removeTab(tab, true);
             return;
           }
           if(m.choose){
-            if(tab.restored){
+            // {choose} means the server has no launched session for this sid.
+            // Only a tab we created and haven't seen launched expects that;
+            // for a restored or confirmed tab the session was lost (restart,
+            // PTY exited and reaped before its notice got through) and our
+            // socket just created an empty, unlaunched one in its place: junk.
+            // Launching here would silently start a new shell in the old tab.
+            if(tab.restored || tab.confirmed){
               disconnect(tab);
-              TabManager.removeStaleTab(tab);
+              TabManager.removeTab(tab, true);
               return;
             }
             const msg = JSON.stringify({launch: tab.kind, projectId: tab.projectId || undefined, defaultCommand: tab.defaultCommand || undefined, label: tab.label || undefined, color: tab.color || undefined});
@@ -59,6 +91,7 @@ window.Connection = (function(){
         return;
       }
       if(tab.restored) tab.restored = false;
+      tab.confirmed = true;                   // PTY output: the session is launched
       tab.reconnectFails = 0;
       if(tab.recvOffset != null) tab.recvOffset += e.data.byteLength;
       const buf = tab.term.buffer.active;
@@ -68,6 +101,8 @@ window.Connection = (function(){
 
     sock.onclose = (ev) => {
       if(tab.ws !== sock) return;             // superseded locally (same-device reconnect) — ignore stale socket
+      stopHeartbeat(tab);
+      clearConnectTimer(tab);
       if(ev.reason === 'replaced'){           // server kicked us: another client took this sid
         showTakeover(tab);
         return;                               // do NOT reconnect — breaks the ping-pong
@@ -77,11 +112,77 @@ window.Connection = (function(){
     sock.onerror = () => { try { sock.close(); } catch{} };
   }
 
+  // Heartbeat. After a network switch or sleep the browser can keep a socket at
+  // readyState 1 that the server dropped long ago, and JS can't see protocol
+  // pings, so echo {ping}/{pong} and judge by when a frame last arrived.
+  const PING_EVERY = 15000, DEAD_AFTER = 35000, PROBE_DEADLINE = 3000, CONNECT_TIMEOUT = 10000;
+
+  function clearConnectTimer(tab){
+    if(tab.connectTimer){ clearTimeout(tab.connectTimer); tab.connectTimer = null; }
+  }
+
+  function startHeartbeat(tab, sock){
+    stopHeartbeat(tab);
+    tab.lastRecv = Date.now();
+    let lastBeat = Date.now();
+    tab.hbTimer = setInterval(() => {
+      if(tab.ws !== sock || sock.readyState !== 1){ stopHeartbeat(tab); return; }
+      const now = Date.now();
+      // Hidden pages run timers late (up to minutes), so a stale lastRecv there
+      // may only mean our pings went out late. Judge on prompt ticks while
+      // visible; wake re-checks via probe().
+      const fair = !document.hidden && now - lastBeat < PING_EVERY + 10000;
+      lastBeat = now;
+      if(fair && now - tab.lastRecv > DEAD_AFTER){ declareDead(tab, sock); return; }
+      sendJson(tab, {ping: now});
+    }, PING_EVERY);
+  }
+
+  function stopHeartbeat(tab){
+    if(tab.hbTimer){ clearInterval(tab.hbTimer); tab.hbTimer = null; }
+    if(tab.probeTimer){ clearTimeout(tab.probeTimer); tab.probeTimer = null; }
+  }
+
+  // Ping now and give the socket a short deadline to show any frame.
+  function probe(tab, sock){
+    if(tab.probeTimer) return;
+    const sent = Date.now();
+    sendJson(tab, {ping: sent});
+    tab.probeTimer = setTimeout(() => {
+      tab.probeTimer = null;
+      if(tab.ws !== sock || sock.readyState !== 1) return;
+      if(document.hidden) return;             // late timer, not proof; the next wake probes again
+      if(tab.lastRecv < sent) declareDead(tab, sock);
+    }, PROBE_DEADLINE);
+  }
+
+  // A half-open socket may take minutes to fire onclose, so drop it now and
+  // take the ordinary reconnect path. tab.recvOffset is untouched, so the new
+  // socket resumes the replay where the screen left off.
+  function declareDead(tab, sock){
+    stopHeartbeat(tab);
+    clearConnectTimer(tab);
+    sock.onclose = null;
+    sock.onerror = null;
+    try{ sock.close(); }catch{}
+    if(tab.ws === sock) tab.ws = null;
+    scheduleReconnect(tab);
+  }
+
   // term.resize() applies immediately but term.write() is queued, so a resize
   // must ride the write queue to land between the right bytes.
   function queueResize(tab, cols, rows){
     tab.term.write('', () => {
       try{ if(cols !== tab.term.cols || rows !== tab.term.rows) tab.term.resize(cols, rows); }catch{}
+    });
+  }
+
+  // Same for reset(): bytes from the previous socket may still be queued, and
+  // an immediate reset would let them parse on top of the fresh replay.
+  function queueReset(tab, then){
+    tab.term.write('', () => {
+      try{ tab.term.reset(); }catch{}
+      if(then) then();
     });
   }
 
@@ -96,7 +197,12 @@ window.Connection = (function(){
       if(d && d.cols && d.rows){
         tab.sentCols = d.cols; tab.sentRows = d.rows;
         sendJson(tab, {cols: d.cols, rows: d.rows});
+        jiggleIfTruncated(tab, d.cols, d.rows);
       }
+    } else {
+      // Hidden: nothing was sent on this socket, and another device may have
+      // resized the PTY meanwhile, so make the next forceResize send.
+      tab.sentCols = tab.sentRows = null;
     }
     tab.term.write('', () => {
       // The socket may have dropped and a new replay started while this one
@@ -106,9 +212,22 @@ window.Connection = (function(){
       // forceResize fits it (and runs a pending repaint) on tab switch.
       if(TabManager.getActive() !== tab) return;
       sendSize(tab);
+      // Hidden at replayEnd but switched to during the drain.
+      jiggleIfTruncated(tab, tab.term.cols, tab.term.rows);
       // Queued by hardRefresh: repaint on top of the finished replay.
       runPendingJiggle(tab);
     });
+  }
+
+  // A capped replay starts mid-stream, so rows ConPTY drew before the start
+  // and never redrew (e.g. the top of the screen under a long spinner) are
+  // blank. A real size change already makes ConPTY/Claude repaint; only at an
+  // unchanged size is a jiggle needed, and adding one then would just print
+  // the transcript twice.
+  function jiggleIfTruncated(tab, cols, rows){
+    if(!tab.replayTruncated) return;
+    tab.replayTruncated = false;
+    if(cols === tab.replayCols && rows === tab.replayRows) tab.pendingJiggle = true;
   }
 
   function runPendingJiggle(tab){
@@ -133,9 +252,12 @@ window.Connection = (function(){
         return r.json();
       }).then(list => {
         if(!list) return;
-        if(!list.find(s => s.sid === tab.sid)){
+        // Only forget the tab locally: failing to reach the socket is not proof
+        // the session is dead, and another device may still resume it. An
+        // unconfirmed tab is expected to be absent, so keep retrying it.
+        if(tab.confirmed && !list.find(s => s.sid === tab.sid)){
           disconnect(tab);
-          TabManager.removeStaleTab(tab);
+          TabManager.removeTab(tab, false);
         }
       }).catch(() => {});
     }
@@ -185,9 +307,13 @@ window.Connection = (function(){
         const c = tab.term.cols, r = tab.term.rows;
         try{ tab.term.refresh(0, r - 1); }catch{}
         tab.term.scrollToBottom();
-        tab.sentCols = c; tab.sentRows = r;
-        sendJson(tab, {cols:c, rows:r});
-        runPendingJiggle(tab);                // reload whose replay finished while hidden
+        // Only a real change: a same-size resize just makes Claude reprint.
+        if(c !== tab.sentCols || r !== tab.sentRows){
+          tab.sentCols = c; tab.sentRows = r;
+          sendJson(tab, {cols:c, rows:r});
+        }
+        jiggleIfTruncated(tab, c, r);         // capped replay that finished while hidden
+        runPendingJiggle(tab);               // reload whose replay finished while hidden
       });
     });
   }
@@ -222,9 +348,10 @@ window.Connection = (function(){
     tab.takenOver = false;
     refreshTakeover(tab);
     remeasure(tab);
-    try{ tab.term.reset(); }catch{}
+    // Fit after the reset too, so a resize still queued from the old replay
+    // can't land after it. Both run before the new socket's bytes.
+    queueReset(tab, () => { try{ tab.fitAddon.fit(); }catch{} });
     tab.recvOffset = null;                    // screen wiped: ask for the full replay
-    try{ tab.fitAddon.fit(); }catch{}
     tab.pendingJiggle = true;
     tab.reconnectDelay = 500;
     connect(tab);
@@ -232,6 +359,8 @@ window.Connection = (function(){
 
   function disconnect(tab){
     if(tab.reconnectTimer){ clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; }
+    stopHeartbeat(tab);
+    clearConnectTimer(tab);
     if(tab.ws){
       tab.ws.onclose = null;
       tab.ws.onerror = null;
@@ -246,6 +375,9 @@ window.Connection = (function(){
       if(tab.reconnectTimer){ clearTimeout(tab.reconnectTimer); tab.reconnectTimer = null; }
       tab.reconnectDelay = 500;
       connect(tab);
+    } else if(tab.ws.readyState === 1 && Date.now() - (tab.lastRecv || 0) > 5000){
+      // readyState 1 proves nothing after sleep or a network switch.
+      probe(tab, tab.ws);
     }
   }
 

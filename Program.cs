@@ -256,13 +256,12 @@ _ = Task.Run(async () =>
     while (true)
     {
         await Task.Delay(TimeSpan.FromMinutes(1));
-        var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(30);
+        var now = DateTime.UtcNow;
         foreach (var kv in sessions)
         {
-            var shouldReap = kv.Value.IsIdleSince(cutoff) || kv.Value.PtyExited;
-            if (shouldReap && sessions.TryRemove(kv.Key, out var s))
+            var reason = kv.Value.ReapReason(now);
+            if (reason != null && sessions.TryRemove(kv.Key, out var s))
             {
-                var reason = s.PtyExited ? "pty exited" : "idle 30m";
                 Log($"SESSION REAPED sid={kv.Key[..8]}… ({reason}, {s.Stats})");
                 s.Dispose();
                 BroadcastSse("tab_closed", new { sid = kv.Key });
@@ -1136,14 +1135,65 @@ sealed class Session : IDisposable
     // ~2 MB of ConPTY output is roughly what fills the client's 5000-line xterm
     // scrollback for Claude (whose redraws and spinner are escape-heavy).
     const int MaxBuffer = 2 * 1024 * 1024;
+    // A replay that can't resume from the client's offset starts no earlier
+    // than this. Parsing 2 MB (plus a reflow at each size marker) stalls a
+    // phone for seconds, with live output and typed echo queued behind it.
+    const int MaxReplay = 512 * 1024;
+    // A live PTY is reaped only after this long both detached and silent.
+    static readonly TimeSpan SilentReapAfter = TimeSpan.FromHours(24);
+    // A session with no PTY is junk once detached this long.
+    static readonly TimeSpan UnlaunchedReapAfter = TimeSpan.FromMinutes(10);
 
     public IPtyConnection? Pty { get; private set; }
     readonly object _lock = new();
     readonly LinkedList<(long start, byte[] data)> _chunks = new();
     long _totalBytes;
-    WebSocket? _current;
-    Channel<byte[]>? _channel;
+    // A dead socket (phone woke from sleep) never answers a close handshake, so
+    // ending an attachment is bounded by this before the socket is aborted.
+    static readonly TimeSpan CloseTimeout = TimeSpan.FromSeconds(5);
+    // A single send blocked this long means the peer stopped reading; abort it.
+    static readonly TimeSpan StallTimeout = TimeSpan.FromSeconds(60);
+
+    // One socket attached to this session. Its send pump is the socket's only
+    // sender: replay, PTY output (binary), replies like pongs (text), and
+    // finally the close frame, so no two SendAsync/close calls ever overlap.
+    sealed class Attachment
+    {
+        public readonly WebSocket Ws;
+        public readonly Channel<(bool text, byte[] payload)> Ch =
+            Channel.CreateUnbounded<(bool text, byte[] payload)>(new UnboundedChannelOptions { SingleReader = true });
+        // Armed when the attachment ends; aborts the socket if the pump or the
+        // close handshake is still stuck. Not disposed: CancelAfter may still be
+        // called after Attach returns, and an abort on a closed socket is a no-op.
+        public readonly CancellationTokenSource Deadline = new();
+        // Written under the session lock but read lock-free by the pump, so it
+        // is published with Volatile.Write after CloseReason.
+        public bool Ended;
+        // Close frame the pump sends once the channel drains (or at once for
+        // "replaced" and "pty-exited"); null when the client already left.
+        public string? CloseReason;
+        // Text frame the pump sends just before the close, after skipping or
+        // draining the queue. Set with CloseReason, before Ended.
+        public byte[]? FinalFrame;
+
+        // A replaced or exited client gets no more output: it only needs the
+        // final frame and the close, and draining a big replay over a slow link
+        // would outlast the deadline, which aborts with 1006 and makes the
+        // client reconnect instead (for an exited PTY, possibly into a fresh
+        // session once the reaper has removed this one).
+        public bool SkipsQueue => Volatile.Read(ref Ended) && CloseReason is "replaced" or "pty-exited";
+
+        public Attachment(WebSocket ws)
+        {
+            Ws = ws;
+            Deadline.Token.Register(ws.Abort);
+        }
+    }
+
+    Attachment? _att;
     DateTime _lastDetached = DateTime.UtcNow;
+    // Last PTY output. A detached session still printing is still working.
+    DateTime _lastOutput = DateTime.UtcNow;
     bool _disposed;
     bool _ptyExited;
     // Size to spawn the PTY at, set by resizes that arrive before launch.
@@ -1156,10 +1206,6 @@ sealed class Session : IDisposable
     readonly List<(long at, int cols, int rows)> _sizes = new();
     bool _launched;
     readonly DateTime _createdAt = DateTime.Now;
-    // TEMP: one-off log when the ring buffer first fills, to size MaxBuffer from real data.
-    bool _bufferFullLogged;
-    Action<string>? _log;
-    string? _sidShort;
     int _inputCount;
     string? _kind;
     string? _label;
@@ -1190,7 +1236,7 @@ sealed class Session : IDisposable
     public string? Label { get { lock (_lock) return _label; } }
     public string? Color { get { lock (_lock) return _color; } }
     public string? ProjectId { get { lock (_lock) return _projectId; } }
-    public bool HasWebSocket { get { lock (_lock) return _current != null; } }
+    public bool HasWebSocket { get { lock (_lock) return _att != null; } }
     public bool PtyExited { get { lock (_lock) return _ptyExited; } }
 
     public void Launch(string kind, string? projectId, SettingsManager sm, string sid, string sidShort, Action<string> log, string? defaultCommand = null)
@@ -1201,8 +1247,6 @@ sealed class Session : IDisposable
             _launched = true;
             _kind ??= kind;
             _projectId ??= projectId;
-            _log = log;
-            _sidShort = sidShort;
             RecordSize(_cols, _rows);
         }
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -1350,10 +1394,10 @@ sealed class Session : IDisposable
                 var copy = new byte[n];
                 Buffer.BlockCopy(buf, 0, copy, 0, n);
 
-                Channel<byte[]>? ch;
-                string? fullMsg = null;
+                Channel<(bool text, byte[] payload)>? ch;
                 lock (_lock)
                 {
+                    _lastOutput = DateTime.UtcNow;
                     _chunks.AddLast((_totalBytes, copy));
                     _totalBytes += n;
                     while (_chunks.Count > 1)
@@ -1363,37 +1407,72 @@ sealed class Session : IDisposable
                         if (afterEvict >= MaxBuffer) _chunks.RemoveFirst();
                         else break;
                     }
-                    if (!_bufferFullLogged && _totalBytes >= MaxBuffer)
-                    {
-                        // TEMP: how much time / how many lines one buffer's worth covers.
-                        _bufferFullLogged = true;
-                        long newlines = 0, bytes = 0;
-                        foreach (var (_, d) in _chunks) { bytes += d.Length; newlines += d.AsSpan().Count((byte)'\n'); }
-                        fullMsg = $"BUFFER FULL sid={_sidShort}… kind={_kind} after {FormatDuration(DateTime.Now - _createdAt)}: {bytes / 1024} KB, {newlines} newlines buffered";
-                    }
                     // Keep only the last size at-or-before the oldest byte, plus later ones.
                     var oldestStart = _chunks.First!.Value.start;
                     while (_sizes.Count > 1 && _sizes[1].at <= oldestStart) _sizes.RemoveAt(0);
-                    ch = _channel;
+                    ch = _att?.Ch;
                 }
-                ch?.Writer.TryWrite(copy);
-                if (fullMsg != null) _log?.Invoke(fullMsg);
+                ch?.Writer.TryWrite((false, copy));
             }
         }
         catch { }
 
-        WebSocket? ws;
         lock (_lock)
         {
             _ptyExited = true;
-            ws = _current;
+            // Through the pump (sending here would race its SendAsync), as its
+            // final frame rather than queued: the pump skips the queue for
+            // "pty-exited", so the notice can't sit behind a slow replay until
+            // the deadline aborts the socket and the client reconnects instead.
+            if (_att is { } a)
+                EndAttachment(a, "pty-exited", Encoding.UTF8.GetBytes("{\"ptyExited\":true}"));
         }
-        if (ws != null)
+    }
+
+    // Call under _lock. Stops the attachment's pump after it drains what is
+    // queued (or at once for "replaced" and "pty-exited"), has it send
+    // `finalFrame` and then `reason` as the close frame, and arms the abort
+    // deadline. Only the first call counts.
+    static void EndAttachment(Attachment a, string? reason, byte[]? finalFrame = null)
+    {
+        if (a.Ended) return;
+        a.CloseReason = reason;
+        a.FinalFrame = finalFrame;
+        // After CloseReason/FinalFrame, so a pump that sees Ended also sees them.
+        Volatile.Write(ref a.Ended, true);
+        a.Ch.Writer.TryComplete();
+        a.Deadline.CancelAfter(CloseTimeout);
+    }
+
+    static async Task SendPump(Attachment a)
+    {
+        var ws = a.Ws;
+        using var stall = new CancellationTokenSource();
+        using var reg = stall.Token.Register(ws.Abort);
+        try
         {
-            var exitMsg = Encoding.UTF8.GetBytes("{\"ptyExited\":true}");
-            try { await ws.SendAsync(exitMsg, WebSocketMessageType.Text, true, default); } catch { }
-            try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "pty-exited", default); } catch { }
+            await foreach (var (text, payload) in a.Ch.Reader.ReadAllAsync())
+            {
+                if (ws.CloseStatus.HasValue) return;
+                // Skip the rest of the queue. A send already in flight is let
+                // finish: the close can't overlap it, and cancelling a send
+                // aborts the socket, which is what this avoids. The deadline
+                // still aborts if that send never completes.
+                if (a.SkipsQueue) break;
+                stall.CancelAfter(StallTimeout);
+                await ws.SendAsync(payload, text ? WebSocketMessageType.Text : WebSocketMessageType.Binary, true, default);
+                stall.CancelAfter(Timeout.InfiniteTimeSpan);
+            }
+            // Reached only once the attachment has ended (the channel is
+            // completed then), so FinalFrame is visible here.
+            if (a.FinalFrame is { } final && ws.State is WebSocketState.Open or WebSocketState.CloseReceived)
+                await ws.SendAsync(final, WebSocketMessageType.Text, true, default);
+            // Output only: the attachment's receive loop reads the client's
+            // close reply, and the deadline aborts if none comes.
+            if (a.CloseReason is { } reason && ws.State is WebSocketState.Open or WebSocketState.CloseReceived)
+                await ws.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, reason, default);
         }
+        catch { }
     }
 
     // Call under _lock. Markers land on chunk boundaries because ReadLoop
@@ -1418,91 +1497,113 @@ sealed class Session : IDisposable
         return true;
     }
 
+    // Call under _lock, with oldest < cap <= _totalBytes. First position at or
+    // after `cap` where the terminal parser is back in its ground state: just
+    // before an ESC (which aborts any sequence in progress) or just after a LF.
+    // Chunks are arbitrary 4 KB reads, not ConPTY write boundaries, so a chunk
+    // start can split an escape or UTF-8 sequence and print stray characters.
+    // Bounded so a long plain-text run can't shrink the replay much; past the
+    // bound, at least skip UTF-8 continuation bytes. The result may be
+    // mid-chunk: Attach slices the first chunk, and size markers (on chunk
+    // boundaries) at or before it are folded into the offset frame's size.
+    long SafeReplayStart(long cap)
+    {
+        const int MaxScan = 16 * 1024;
+        var limit = Math.Min(cap + MaxScan, _totalBytes);
+        var fallback = -1L;
+        byte prev = 0;   // byte at p - 1
+        foreach (var (start, data) in _chunks)
+        {
+            var end = start + data.Length;
+            if (end < cap) continue;   // the chunk ending at cap holds byte cap - 1
+            for (var p = Math.Max(start, cap - 1); p < end && p < limit; p++)
+            {
+                var b = data[p - start];
+                if (p >= cap)
+                {
+                    if (b == 0x1B || prev == (byte)'\n') return p;
+                    if (fallback < 0 && (b & 0xC0) != 0x80) fallback = p;
+                }
+                prev = b;
+            }
+            if (end >= limit) break;
+        }
+        return fallback >= 0 ? fallback : cap;
+    }
+
     static byte[] SizeFrame(int cols, int rows)
         => Encoding.UTF8.GetBytes($"{{\"size\":{{\"cols\":{cols},\"rows\":{rows}}}}}");
 
     public async Task Attach(WebSocket ws, SettingsManager sm, string sid, string sidShort, string ip, Action<string> log, long? from = null, int? fromCols = null, int? fromRows = null)
     {
-        WebSocket? old;
-        Channel<byte[]>? oldCh;
-        // Replay frames in order: PTY bytes (binary) interleaved with size changes (text).
-        List<(bool text, byte[] payload)> snapshot = new();
-        long replayStart;
-        int startCols, startRows;
-        Channel<byte[]> ch;
+        var a = new Attachment(ws);
+        var ch = a.Ch;
+        Attachment? old;
         lock (_lock)
         {
-            old = _current;
-            oldCh = _channel;
-            _current = ws;
-            ch = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
-            _channel = ch;
+            old = _att;
             // Resume from the client's offset when it's still inside the buffer and
             // the PTY stayed at the client's grid size from there on; otherwise
-            // replay everything and the client wipes its screen first. Resuming
-            // across a size change would make xterm reflow the screen it already
-            // has (rewrapped lines, rows pushed into scrollback).
+            // replay the tail of the buffer and the client wipes its screen first.
+            // Resuming across a size change would make xterm reflow the screen it
+            // already has (rewrapped lines, rows pushed into scrollback).
             var oldest = _chunks.First?.Value.start ?? _totalBytes;
-            replayStart = from is long fr && fr >= oldest && fr <= _totalBytes
-                          && SizeUnchangedSince(fr, fromCols, fromRows) ? fr : oldest;
-            if (from is long req && replayStart != req && req >= oldest && req <= _totalBytes)
-                log($"WS RESUME DECLINED sid={sidShort}… PTY size changed since offset {req}; full replay");
-            (startCols, startRows) = (0, 0);   // unlaunched: nothing recorded, client keeps its own size
+            var resumed = from is long fr && fr >= oldest && fr <= _totalBytes
+                          && SizeUnchangedSince(fr, fromCols, fromRows);
+            var replayStart = resumed ? from!.Value : oldest;
+            // Not resuming: replay only the last MaxReplay bytes, from a point
+            // that isn't inside an escape or UTF-8 sequence (see SafeReplayStart).
+            var truncated = false;
+            if (!resumed && _totalBytes - oldest > MaxReplay)
+            {
+                replayStart = SafeReplayStart(_totalBytes - MaxReplay);
+                truncated = true;
+            }
+            if (from is long req && !resumed && req >= oldest && req <= _totalBytes)
+                log($"WS RESUME DECLINED sid={sidShort}… PTY size changed since offset {req}; replay from {replayStart}{(truncated ? " (capped)" : "")}");
+            // Size in effect at the start; markers at or before it are folded in
+            // here and never sent.
+            var (startCols, startRows) = (0, 0);   // unlaunched: nothing recorded, client keeps its own size
             var si = 0;
             for (; si < _sizes.Count && _sizes[si].at <= replayStart; si++)
                 (startCols, startRows) = (_sizes[si].cols, _sizes[si].rows);
+            // The replay is queued for the pump rather than sent here, so this
+            // attach never waits on a slow or vanished client, and it is in the
+            // channel before ReadLoop can append live output after it.
+            // `truncated`: earlier output was dropped, so the screen may miss
+            // rows ConPTY drew before the start and never redrew since, and
+            // modes set before it (SGR, cursor visibility) are lost. The client
+            // resets xterm first and then nudges the size so ConPTY repaints
+            // with absolute positions and full SGR; input modes don't matter
+            // because the client builds its own key sequences.
+            ch.Writer.TryWrite((true, Encoding.UTF8.GetBytes(
+                $"{{\"offset\":{replayStart},\"cols\":{startCols},\"rows\":{startRows}{(truncated ? ",\"truncated\":true" : "")}}}")));
+            // PTY bytes (binary) interleaved with size changes (text).
             foreach (var (start, data) in _chunks)
             {
                 var end = start + data.Length;
                 if (end <= replayStart) continue;
                 for (; si < _sizes.Count && _sizes[si].at <= start; si++)
-                    snapshot.Add((true, SizeFrame(_sizes[si].cols, _sizes[si].rows)));
-                snapshot.Add((false, start >= replayStart ? data : data[(int)(replayStart - start)..]));
+                    ch.Writer.TryWrite((true, SizeFrame(_sizes[si].cols, _sizes[si].rows)));
+                ch.Writer.TryWrite((false, start >= replayStart ? data : data[(int)(replayStart - start)..]));
             }
             for (; si < _sizes.Count; si++)
-                snapshot.Add((true, SizeFrame(_sizes[si].cols, _sizes[si].rows)));
+                ch.Writer.TryWrite((true, SizeFrame(_sizes[si].cols, _sizes[si].rows)));
+            ch.Writer.TryWrite((true, Encoding.UTF8.GetBytes("{\"replayEnd\":true}")));
+            if (!_launched)
+                ch.Writer.TryWrite((true, Encoding.UTF8.GetBytes("{\"choose\":true}")));
+            else if (_ptyExited)
+                ch.Writer.TryWrite((true, Encoding.UTF8.GetBytes("{\"ptyExited\":true}")));
+            _att = a;
+            // The old socket still gets "replaced" (the client shows its takeover
+            // popup on it instead of reconnect-looping), but from its own pump
+            // and bounded by its deadline, not awaited here: a phone waking from
+            // sleep leaves a dead socket that would never finish the handshake.
+            if (old != null) EndAttachment(old, "replaced");
         }
-        oldCh?.Writer.TryComplete();
-        if (old != null)
-        {
-            log($"WS REPLACED sid={sidShort}… old connection closed");
-            using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            try { await old.CloseAsync(WebSocketCloseStatus.NormalClosure, "replaced", closeCts.Token); } catch { }
-        }
+        if (old != null) log($"WS REPLACED sid={sidShort}… closing old connection");
 
-        try
-        {
-            var offsetMsg = Encoding.UTF8.GetBytes($"{{\"offset\":{replayStart},\"cols\":{startCols},\"rows\":{startRows}}}");
-            await ws.SendAsync(offsetMsg, WebSocketMessageType.Text, true, default);
-            foreach (var (text, payload) in snapshot)
-                await ws.SendAsync(payload, text ? WebSocketMessageType.Text : WebSocketMessageType.Binary, true, default);
-            var endMsg = Encoding.UTF8.GetBytes("{\"replayEnd\":true}");
-            await ws.SendAsync(endMsg, WebSocketMessageType.Text, true, default);
-            if (!IsLaunched)
-            {
-                var msg = Encoding.UTF8.GetBytes("{\"choose\":true}");
-                await ws.SendAsync(msg, WebSocketMessageType.Text, true, default);
-            }
-            else if (PtyExited)
-            {
-                var msg = Encoding.UTF8.GetBytes("{\"ptyExited\":true}");
-                await ws.SendAsync(msg, WebSocketMessageType.Text, true, default);
-            }
-        }
-        catch { }
-
-        var sendPump = Task.Run(async () =>
-        {
-            try
-            {
-                await foreach (var data in ch.Reader.ReadAllAsync())
-                {
-                    if (ws.CloseStatus.HasValue) break;
-                    await ws.SendAsync(data, WebSocketMessageType.Binary, true, default);
-                }
-            }
-            catch { }
-        });
+        var sendPump = SendPump(a);
 
         var buf2 = new byte[4096];
         try
@@ -1511,13 +1612,23 @@ sealed class Session : IDisposable
             {
                 var r = await ws.ReceiveAsync(buf2, default);
                 if (r.MessageType == WebSocketMessageType.Close) break;
+                // A replaced socket stays open only to finish its close
+                // handshake; its stale input or resizes must not reach the PTY.
+                if (Volatile.Read(ref _att) != a) continue;
                 if (r.MessageType == WebSocketMessageType.Text)
                 {
                     try
                     {
                         using var doc = JsonDocument.Parse(buf2.AsMemory(0, r.Count));
                         var root = doc.RootElement;
-                        if (root.TryGetProperty("launch", out var lk) && lk.ValueKind == JsonValueKind.String)
+                        // Client heartbeat: browsers can't see protocol pings, so a
+                        // half-open socket is only detectable by an app-level echo.
+                        // Through the pump, since only it may SendAsync on this socket.
+                        if (root.TryGetProperty("ping", out var pg) && pg.ValueKind == JsonValueKind.Number)
+                        {
+                            ch.Writer.TryWrite((true, Encoding.UTF8.GetBytes($"{{\"pong\":{pg.GetRawText()}}}")));
+                        }
+                        else if (root.TryGetProperty("launch", out var lk) && lk.ValueKind == JsonValueKind.String)
                         {
                             string? projId = null;
                             if (root.TryGetProperty("projectId", out var pid) && pid.ValueKind == JsonValueKind.String)
@@ -1555,24 +1666,37 @@ sealed class Session : IDisposable
         {
             lock (_lock)
             {
-                if (_current == ws)
+                // Only clears the session if still current: a replaced
+                // attachment ending late must not detach its successor.
+                if (_att == a)
                 {
-                    _current = null;
-                    _channel?.Writer.TryComplete();
-                    _channel = null;
+                    _att = null;
                     _lastDetached = DateTime.UtcNow;
                 }
+                EndAttachment(a, null);
             }
             log($"WS DISCONNECTED sid={sidShort}… from {ip} ({Stats})");
             try { await sendPump; } catch { }
         }
     }
 
-    public bool IsIdleSince(DateTime cutoff)
+    // Why the reaper should dispose this session now, or null to keep it. A live PTY
+    // survives any detach (a phone asleep overnight, Claude waiting at its prompt);
+    // it goes only once nobody has attached and it has printed nothing for a day.
+    public string? ReapReason(DateTime now)
     {
         lock (_lock)
         {
-            return _current == null && _lastDetached < cutoff;
+            if (_ptyExited) return "pty exited";
+            if (_att != null) return null;
+            var detached = now - _lastDetached;
+            // No PTY: never launched (a /ws GetOrAdd nobody followed up) or the spawn failed.
+            if (Pty == null)
+                return detached >= UnlaunchedReapAfter ? $"never launched, detached {FormatDuration(detached)}" : null;
+            var silent = now - _lastOutput;
+            if (detached >= SilentReapAfter && silent >= SilentReapAfter)
+                return $"detached {FormatDuration(detached)}, no output for {FormatDuration(silent)}";
+            return null;
         }
     }
 
