@@ -452,10 +452,25 @@ app.MapGet("/api/transcript/{sid}", (string sid, HttpContext ctx) =>
         var (offset, items, restarted) = Transcript.Read(path, from);
         return Results.Json(new { path, offset, reset = from == 0 || restarted, items }, Transcript.JsonOpts);
     }
-    catch (IOException ex)
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
     {
         return Results.Json(new { error = ex.Message }, statusCode: 503);
     }
+});
+
+app.MapGet("/api/transcript/{sid}/image", (string sid, string? path, long at, int n, HttpContext ctx) =>
+{
+    if (!Transcript.IsValidPath(path) || !sessions.TryGetValue(sid, out var session)) return Results.NotFound();
+    var full = Path.GetFullPath(path!);
+    if (!session.HasServedTranscript(full)) return Results.NotFound();
+    try
+    {
+        if (Transcript.Image(full, at, n) is not { } img) return Results.NotFound();
+        // The type comes from the log: raster only (Transcript.Image), and never sniffed.
+        ctx.Response.Headers.XContentTypeOptions = "nosniff";
+        return Results.File(img.Data, img.MediaType);
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return Results.NotFound(); }
 });
 
 app.MapGet("/api/file/{id}", (string id) =>
@@ -1326,6 +1341,9 @@ sealed class Session : IDisposable
     // Claude's .jsonl conversation log: reported by the webterm-notify hook
     // (exact), else guessed from the cwd's project folder (sticky, see Transcript.Guess).
     string? _transcript, _transcriptGuess;
+    // Every log TranscriptPath has handed out (kept across /clear), so the
+    // image endpoint serves only this session's logs.
+    readonly HashSet<string> _servedTranscripts = new(StringComparer.OrdinalIgnoreCase);
 
     public static Session Create(string? kind = null, string? label = null, string? color = null, string? projectId = null)
         => new Session { _kind = kind, _label = label, _color = color, _projectId = projectId };
@@ -1366,12 +1384,22 @@ sealed class Session : IDisposable
         string? cwd, reported, guess, kind;
         DateTime launched;
         lock (_lock) { cwd = _cwd; reported = _transcript; guess = _transcriptGuess; launched = _launchedUtc; kind = _kind; }
-        if (reported != null && File.Exists(reported)) return reported;
+        if (reported != null && File.Exists(reported))
+        {
+            lock (_lock) _servedTranscripts.Add(reported);
+            return reported;
+        }
         if (cwd == null || kind == "powershell") return null;
         guess = Transcript.Guess(cwd, launched, guess, claimedElsewhere);
-        lock (_lock) _transcriptGuess = guess;
+        lock (_lock)
+        {
+            _transcriptGuess = guess;
+            if (guess != null) _servedTranscripts.Add(guess);
+        }
         return guess;
     }
+
+    public bool HasServedTranscript(string path) { lock (_lock) return _servedTranscripts.Contains(path); }
 
     public void Launch(string kind, string? projectId, SettingsManager sm, string sid, string sidShort, Action<string> log, string? defaultCommand = null)
     {

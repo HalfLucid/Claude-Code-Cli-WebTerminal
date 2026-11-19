@@ -186,11 +186,27 @@
     }
     if(!data || !data.paths || !data.paths.length){ showToast('Nothing uploaded'); return; }
 
+    hideToast();
+    // A tab in the HTML view gets them as attachments on its message box
+    // (typed into Claude's hidden prompt they'd ride along unseen).
+    if(window.HistoryView && HistoryView.attach(tab, data.paths)) return;
     // Quote paths containing spaces, matching what a terminal inserts on drop.
     // Trailing space so the next thing typed doesn't run into the path.
-    sendPaste(data.paths.map(p => /\s/.test(p) ? '"' + p + '"' : p).join(' ') + ' ');
-    hideToast();
+    const text = data.paths.map(quotePath).join(' ') + ' ';
+    // The upload's own tab, even if the user switched tabs meanwhile. Like
+    // sendPaste, drop that tab's input mirror (saved while it's inactive), or
+    // a later DEL-based edit there would erase the path.
+    if(TabManager.getActive() === tab) sendPaste(text);
+    else {
+      Connection.send(tab, '\x1b[200~' + text + '\x1b[201~');
+      tab.savedInput = '';
+      tab.savedSent = '';
+    }
   }
+  function quotePath(p){ return /\s/.test(p) ? '"' + p + '"' : p; }
+  window.quotePath = quotePath;
+  window.uploadFiles = uploadFiles;
+  window.filesFrom = filesFrom;
 
   // Without preventDefault on dragover the browser navigates away to the dropped
   // image — the "opens a new tab" behaviour this replaces.
@@ -329,11 +345,13 @@
   await reconcileSessions();
   if(TabManager.getAll().length === 0) TabManager.showMainScreen();
 
-  function showFileOverlay(fileId, name, caption, kind){
+  // url: a direct source (history thumbnails) instead of a show_file id, so
+  // there's no server reference to drop on dismiss.
+  function showFileOverlay(fileId, name, caption, kind, url){
     var existing = document.getElementById('img-overlay');
     if(existing) existing._dismiss ? existing._dismiss() : existing.remove();
 
-    var src = '/api/file/' + fileId;
+    var src = url || '/api/file/' + fileId;
     var overlay = document.createElement('div');
     overlay.id = 'img-overlay';
     overlay.className = 'img-overlay';
@@ -390,7 +408,7 @@
       overlay.remove();
       document.removeEventListener('keydown', onKey);
       // Drop the server-side id->path reference (source file untouched).
-      try { fetch(src, { method: 'DELETE' }); } catch(_){}
+      if(!url) try { fetch(src, { method: 'DELETE' }); } catch(_){}
     }
     overlay._dismiss = dismiss;
     function onKey(ev){ if(ev.key === 'Escape') dismiss(); }
@@ -398,6 +416,8 @@
     overlay.addEventListener('click', function(ev){ if(ev.target === overlay) dismiss(); });
     document.addEventListener('keydown', onKey);
   }
+
+  window.showImage = function(url, name){ showFileOverlay(null, name, null, 'image', url); };
 
   // Silent write needs focus/gesture browsers won't grant here; see CLAUDE.md.
   function receiveCopyText(text, label){

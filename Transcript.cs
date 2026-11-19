@@ -5,9 +5,11 @@ using System.Text.RegularExpressions;
 
 /// <summary>
 /// One display entry of a Claude conversation, distilled from its .jsonl log.
-/// K: user | assistant | cmd | out | tool | result | compact | note.
+/// K: user | assistant | cmd | out | tool | result | compact | note | image.
+/// An image carries Img = "&lt;line offset&gt;:&lt;index&gt;" (see <see cref="Transcript.Image"/>)
+/// and, inside a tool result, the tool call's Id.
 /// </summary>
-sealed record TranscriptItem(string K, string? Text = null, string? Name = null, string? Arg = null, string? Id = null, bool? Err = null);
+sealed record TranscriptItem(string K, string? Text = null, string? Name = null, string? Arg = null, string? Id = null, bool? Err = null, string? Img = null);
 
 /// <summary>
 /// Reads the conversation log Claude Code writes for every session
@@ -106,10 +108,10 @@ static class Transcript
                 if (partial.Length > 0)
                 {
                     partial.Write(buf, start, nl - start);
-                    ParseLine(partial.GetBuffer().AsSpan(0, (int)partial.Length), items);
+                    ParseLine(partial.GetBuffer().AsSpan(0, (int)partial.Length), consumed, items);
                     partial.SetLength(0);
                 }
-                else ParseLine(buf.AsSpan(start, nl - start), items);
+                else ParseLine(buf.AsSpan(start, nl - start), consumed, items);
                 start = nl + 1;
                 consumed = read + start;
             }
@@ -131,19 +133,78 @@ static class Transcript
         return (consumed, items, restarted);
     }
 
-    static void ParseLine(ReadOnlySpan<byte> line, List<TranscriptItem> items)
+    // at: the line's byte offset in the file, which addresses its images.
+    static void ParseLine(ReadOnlySpan<byte> line, long at, List<TranscriptItem> items)
     {
         if (line.IsEmpty) return;
         try
         {
             var reader = new Utf8JsonReader(line);
             using var doc = JsonDocument.ParseValue(ref reader);
-            Process(doc.RootElement, items);
+            Process(doc.RootElement, at, items);
         }
         catch (JsonException) { }
     }
 
-    static void Process(JsonElement o, List<TranscriptItem> items)
+    // A log entry's images in a fixed order (the message's own, and each tool
+    // result's in place), so (line offset, index) finds one again without
+    // shipping the base64 with the transcript.
+    static IEnumerable<JsonElement> ImageBlocks(JsonElement c) =>
+        c.ValueKind == JsonValueKind.Array ? c.EnumerateArray().SelectMany(ImagesIn) : [];
+
+    // One content block's images: itself, or a tool result's. Process walks
+    // blocks with this too, so its indices match ImageBlocks.
+    static IEnumerable<JsonElement> ImagesIn(JsonElement b)
+    {
+        var t = Str(b, "type");
+        if (t == "image") yield return b;
+        else if (t == "tool_result" && b.TryGetProperty("content", out var rc) && rc.ValueKind == JsonValueKind.Array)
+            foreach (var x in rc.EnumerateArray())
+                if (Str(x, "type") == "image") yield return x;
+    }
+
+    // Served same-origin, so raster only: an SVG opened directly could run script.
+    static readonly HashSet<string> ImageTypes = new(StringComparer.OrdinalIgnoreCase)
+        { "image/png", "image/jpeg", "image/gif", "image/webp" };
+
+    const int MaxImageLine = 64 << 20;
+
+    /// <summary>
+    /// The <paramref name="index"/>th image (in <see cref="ImageBlocks"/> order) of
+    /// the log line starting at byte <paramref name="at"/>, decoded; null if there
+    /// is no such base64 image (or <paramref name="at"/> isn't a line start).
+    /// </summary>
+    public static (byte[] Data, string MediaType)? Image(string path, long at, int index)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        if (at < 0 || at >= fs.Length || index < 0) return null;
+        fs.Seek(at, SeekOrigin.Begin);
+        var line = new MemoryStream();
+        var buf = new byte[1 << 16];
+        int n;
+        while ((n = fs.Read(buf, 0, buf.Length)) > 0)
+        {
+            var nl = Array.IndexOf(buf, (byte)'\n', 0, n);
+            line.Write(buf, 0, nl >= 0 ? nl : n);
+            if (nl >= 0) break;
+            if (line.Length > MaxImageLine) return null;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(line.GetBuffer().AsMemory(0, (int)line.Length));
+            if (!doc.RootElement.TryGetProperty("message", out var m) || m.ValueKind != JsonValueKind.Object
+                || !m.TryGetProperty("content", out var c)) return null;
+            var b = ImageBlocks(c).ElementAtOrDefault(index);
+            if (!b.TryGetProperty("source", out var s) || Str(s, "type") != "base64") return null;
+            var mediaType = Str(s, "media_type");
+            var data = Str(s, "data");
+            if (data == null || mediaType == null || !ImageTypes.Contains(mediaType)) return null;
+            return (Convert.FromBase64String(data), mediaType.ToLowerInvariant());
+        }
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException) { return null; }
+    }
+
+    static void Process(JsonElement o, long at, List<TranscriptItem> items)
     {
         if (o.ValueKind != JsonValueKind.Object) return;
         var type = Str(o, "type");
@@ -174,17 +235,17 @@ static class Transcript
             if (Bool(o, "isMeta")) return;
             if (c.ValueKind == JsonValueKind.String) { UserText(c.GetString()!, items); return; }
             if (c.ValueKind != JsonValueKind.Array) return;
+            var img = 0;   // counts in ImageBlocks order
             foreach (var b in c.EnumerateArray())
             {
-                switch (Str(b, "type"))
-                {
-                    case "text": UserText(Str(b, "text") ?? "", items); break;
-                    case "image": items.Add(new("user", "[Image]")); break;
-                    case "tool_result":
-                        items.Add(new("result", Clip(ResultText(b), MaxResultText), Id: Str(b, "tool_use_id"),
-                                      Err: Bool(b, "is_error") ? true : null));
-                        break;
-                }
+                var t = Str(b, "type");
+                var toolId = t == "tool_result" ? Str(b, "tool_use_id") : null;
+                // A tool result's images come before the result, which closes the call they attach to.
+                foreach (var _ in ImagesIn(b)) items.Add(new("image", Id: toolId, Img: $"{at}:{img++}"));
+                if (t == "text") UserText(Str(b, "text") ?? "", items);
+                else if (t == "tool_result")
+                    items.Add(new("result", Clip(ResultText(b), MaxResultText), Id: toolId,
+                                  Err: Bool(b, "is_error") ? true : null));
             }
             return;
         }

@@ -42,6 +42,7 @@ window.HistoryView = (function(){
     bodyEl.addEventListener('scroll', clampButtons, { passive: true });
     window.addEventListener('resize', clampButtons);
     buildInput();
+    overlay.addEventListener('paste', onPaste);
     overlay.append(head, bodyEl);
     document.body.appendChild(overlay);
     // The mobile keyboard overlays the page without resizing it (100dvh stays
@@ -88,7 +89,25 @@ window.HistoryView = (function(){
     if(!tab) return;
     if(openTab === tab){ hide(true); return; }
     tab.view = 'html';
+    terminalToDraft(tab);
     show(tab);
+  }
+
+  // The reverse of draftToTerminal: text typed in the terminal and not yet
+  // sent moves into the message box (and is erased from Claude's prompt, one
+  // DEL per code point as rewrite() would) instead of sitting unseen behind
+  // the overlay, where sendMessage would erase it. Only what #ta mirrored
+  // (sentText) is known; arrow keys reset it, so the cursor is at its end.
+  // A paste's [Pasted text] placeholder can't be read back and stays put.
+  function terminalToDraft(tab){
+    const text = window.sentText || '';
+    if(!text || !window.TabManager || TabManager.getActive() !== tab || !tab.ws || tab.ws.readyState !== 1) return;
+    Connection.send(tab, '\x7f'.repeat(Array.from(text).length));
+    const ta = document.getElementById('ta');
+    if(ta) ta.value = '';
+    window.sentText = '';
+    const st = stateOf(tab);
+    st.draft = st.draft ? st.draft.replace(/\s*$/, ' ') + text : text;
   }
 
   // On tab switch: reopen the history if that's the tab's view.
@@ -108,6 +127,7 @@ window.HistoryView = (function(){
     openTab = tab;
     const st = stateOf(tab);
     msgEl.value = st.draft || '';
+    renderAttach();
     // The message box ends the conversation, like Claude's prompt box ends the
     // terminal; pinned, it sticks to the bottom of the view while scrolling.
     bodyEl.replaceChildren(st.el, inputBar);
@@ -155,8 +175,26 @@ window.HistoryView = (function(){
   function draftToTerminal(tab){
     if(!msgEl) return;
     const text = msgEl.value.replace(/\r\n?/g, '\n').replace(/^\n+|\n+$/g, '');
-    if(!text.trim() || !tab.ws || tab.ws.readyState !== 1) return;
+    if(!tab.ws || tab.ws.readyState !== 1) return;
     const ta = document.getElementById('ta');
+    // With attachments, everything goes as separate pastes 40 ms apart, as
+    // sendMessage sends them (minus the Enter), so each image path becomes its
+    // own [Image #n]; the text can't then go through #ta's diff, which would
+    // race the timed pastes.
+    const st = stateOf(tab);
+    if(st.attach && st.attach.length){
+      const parts = st.attach.map(p => quotePath(p) + ' ');
+      if(text.trim()) parts.push(text);
+      parts.forEach((p, i) => setTimeout(() => Connection.send(tab, '\x1b[200~' + p + '\x1b[201~'), i * 40));
+      if(ta) ta.value = '';
+      window.sentText = '';
+      st.attach = [];
+      renderAttach();
+      msgEl.value = '';
+      growInput();
+      return;
+    }
+    if(!text.trim()) return;
     if(ta && !text.includes('\n')){
       ta.value += text;
       ta.dispatchEvent(new Event('input'));
@@ -187,6 +225,34 @@ window.HistoryView = (function(){
   }
 
   function isOpen(){ return !!openTab; }
+
+  // Button-bar ENT/Tab while open act on the message box when that's what
+  // they'd mean in Claude's prompt: ENT sends a non-empty message, Tab takes
+  // the suggestion into an empty box. Otherwise (e.g. ENT on a menu) false,
+  // and the key goes to the PTY.
+  function key(k){
+    if(!openTab || !msgEl) return false;
+    if(k === 'enter'){
+      if(!msgEl.value.trim() && !(stateOf(openTab).attach || []).length) return false;
+      sendMessage();
+      return true;
+    }
+    if(k === 'tab'){
+      if(msgEl.value || !suggestion) return false;
+      acceptSuggestion();
+      return true;
+    }
+    return false;
+  }
+
+  // A custom button's text (one without Enter) goes into the box instead of
+  // Claude's hidden prompt, where it would ride along with the next message unseen.
+  function insert(text){
+    if(!openTab || !msgEl) return false;
+    msgEl.setRangeText(text, msgEl.selectionStart, msgEl.selectionEnd, 'end');
+    growInput();
+    return true;
+  }
 
   // While open, keys belong to the overlay body, not #ta (see build()).
   function focus(){ if(openTab && bodyEl) bodyEl.focus({ preventScroll: true }); }
@@ -237,8 +303,65 @@ window.HistoryView = (function(){
     send.addEventListener('click', e => { e.preventDefault(); sendMessage(); });
     // Claude's spinner line while it works (see updateStatus).
     statusEl2 = div('history-working');
-    inputBar.append(statusEl2, msgEl, send);
+    attachEl = div('history-attach');
+    inputBar.append(statusEl2, attachEl, msgEl, send);
     return inputBar;
+  }
+
+  // Files pasted or dropped while the overlay shows a tab are uploaded (as in
+  // the terminal) and held per tab as chips until the message is sent.
+  let attachEl = null;
+  const quotePath = p => window.quotePath(p);   // app.js
+
+  // From uploadFiles in app.js: true if the tab is in the HTML view and took them.
+  function attach(tab, paths){
+    if(!tab || !wantsHtml(tab) || !paths || !paths.length) return false;
+    const st = stateOf(tab);
+    st.attach = (st.attach || []).concat(paths);
+    if(openTab === tab) renderAttach();
+    return true;
+  }
+
+  function renderAttach(){
+    if(!attachEl) return;
+    const list = openTab ? (stateOf(openTab).attach || []) : [];
+    attachEl.replaceChildren();
+    attachEl.classList.toggle('show', list.length > 0);
+    list.forEach((p, i) => {
+      const chip = div('h-attach');
+      chip.title = p;
+      chip.appendChild(document.createTextNode(p.split(/[\\/]/).pop()));
+      const x = document.createElement('button');
+      x.textContent = '×';
+      x.title = 'Remove';
+      x.addEventListener('pointerdown', e => e.preventDefault());
+      x.addEventListener('click', e => {
+        e.preventDefault();
+        stateOf(openTab).attach.splice(i, 1);
+        renderAttach();
+      });
+      chip.appendChild(x);
+      attachEl.appendChild(chip);
+    });
+    clampButtons();
+  }
+
+  // Paste anywhere in the overlay: files are attached; text pasted outside a
+  // text field goes into the message box (the body itself isn't editable).
+  function onPaste(e){
+    if(!openTab) return;
+    const cd = e.clipboardData;
+    if(!cd) return;
+    const files = window.filesFrom ? window.filesFrom(cd) : [];
+    if(files.length){ e.preventDefault(); if(window.uploadFiles) window.uploadFiles(files); return; }
+    const t = e.target;
+    if(t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT')) return;   // native text paste
+    const text = cd.getData('text');
+    if(!text) return;
+    e.preventDefault();
+    msgEl.focus({ preventScroll: true });
+    msgEl.setRangeText(text, msgEl.selectionStart, msgEl.selectionEnd, 'end');
+    growInput();
   }
 
   // Grows with its content (max-height in CSS caps it, then it scrolls).
@@ -662,16 +785,25 @@ window.HistoryView = (function(){
   function sendMessage(){
     const tab = openTab;
     const text = msgEl.value.replace(/\r\n?/g, '\n').replace(/^\n+|\s+$/g, '');
-    if(!tab || !text) return;
+    const st = tab && stateOf(tab);
+    const files = (st && st.attach) || [];
+    if(!tab || (!text && !files.length)) return;
     if(!tab.ws || tab.ws.readyState !== 1){ statusEl.textContent = 'not connected, message not sent'; return; }
     const pending = Array.from(window.sentText || '').length;
     if(pending) Connection.send(tab, '\x7f'.repeat(pending));
     const ta = document.getElementById('ta');
     if(ta) ta.value = '';
     window.sentText = '';
-    Connection.send(tab, '\x1b[200~' + text + '\x1b[201~');
-    // A beat later, so the Enter isn't read as part of the paste.
-    setTimeout(() => Connection.send(tab, '\r'), 80);
+    // Each attachment is its own paste, as a terminal drop is, so Claude turns
+    // an image path into an [Image #n] attachment; 40 ms apart so the pastes
+    // stay separate. Then the text, then Enter a beat later so it isn't read
+    // as part of the paste.
+    const parts = files.map(p => quotePath(p) + ' ');
+    if(text) parts.push(text);
+    parts.forEach((p, i) => setTimeout(() => Connection.send(tab, '\x1b[200~' + p + '\x1b[201~'), i * 40));
+    setTimeout(() => Connection.send(tab, '\r'), (parts.length - 1) * 40 + 80);
+    st.attach = [];
+    renderAttach();
     msgEl.value = '';
     growInput();
     bodyEl.scrollTop = bodyEl.scrollHeight;
@@ -741,6 +873,7 @@ window.HistoryView = (function(){
       const stick = first || bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight < 40;
       if(d.reset){ st.el.replaceChildren(); st.tools = {}; }
       st.path = d.path;
+      st.sid = tab.sid;
       st.offset = d.offset;
       st.el.dataset.empty = 'This conversation has no messages yet.';
       // offset already moved past these, so one bad entry must not drop the rest.
@@ -783,6 +916,31 @@ window.HistoryView = (function(){
       case 'cmd': st.el.appendChild(div('h-user', it.text || '')); break;
       case 'out': st.el.appendChild(pre('h-out', it.text || '')); break;
       case 'note': st.el.appendChild(div('h-note', it.text || '')); break;
+      // Thumbnail, full size in the file viewer on click. In a tool result it
+      // goes in the call (the result follows), or a plain row if the call
+      // isn't rendered; otherwise in the user's bubble (Claude logs the
+      // "[Image #1]" text just before it), or its own.
+      case 'image': {
+        const at = String(it.img || '').split(':');
+        const src = '/api/transcript/' + encodeURIComponent(st.sid) + '/image?path=' + encodeURIComponent(st.path) +
+          '&at=' + encodeURIComponent(at[0]) + '&n=' + encodeURIComponent(at[1] || '0');
+        const img = document.createElement('img');
+        img.className = 'h-img';
+        img.loading = 'lazy';
+        img.alt = 'image';
+        img.src = src;
+        img.addEventListener('click', e => { e.preventDefault(); if(window.showImage) showImage(src, 'image'); });
+        const owner = it.id && st.tools[it.id];
+        let host = owner;
+        // Not h-user: jump() would count a tool's image as a user prompt.
+        if(!host && it.id) host = st.el.appendChild(div('h-media'));
+        if(!host){
+          const last = st.el.lastElementChild;
+          host = last && last.classList.contains('h-user') ? last : st.el.appendChild(div('h-user'));
+        }
+        host.appendChild(img);
+        break;
+      }
       case 'compact': {
         const d = document.createElement('details');
         d.className = 'h-compact';
@@ -909,5 +1067,5 @@ window.HistoryView = (function(){
     return out.join('');
   }
 
-  return { toggle, restore, hide, isOpen, focus, scrollPage, jump, togglePin, isPinned };
+  return { toggle, restore, hide, isOpen, focus, attach, key, insert, scrollPage, jump, togglePin, isPinned };
 })();

@@ -194,6 +194,13 @@ body.has-tabs #history-overlay{top:37px;height:calc(100dvh - 37px)}
 .history-input.pinned{position:sticky;bottom:-24px;z-index:1}
 .history-working{display:none;flex:0 0 100%;font:13px monospace;color:#d29922;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .history-working.show{display:block}
+.history-attach{display:none;flex:0 0 100%;flex-wrap:wrap;gap:6px}
+.history-attach.show{display:flex}
+.h-attach{display:inline-flex;align-items:center;gap:4px;max-width:100%;padding:3px 4px 3px 10px;border-radius:12px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;font:13px system-ui,sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.h-attach button{border:0;background:none;color:#8b949e;font-size:15px;line-height:1;cursor:pointer;padding:0 4px}
+.h-attach button:hover{color:#f85149}
+.h-img{display:block;max-width:220px;max-height:160px;margin-top:6px;border-radius:8px;cursor:zoom-in;background:#0d1117}
+.h-user .h-img{margin-left:auto}
 .history-msg{flex:1;resize:none;min-height:62px;max-height:40vh;overflow-y:auto;box-sizing:border-box;padding:9px 12px;border-radius:18px;border:1px solid #30363d;background:#161b22;color:#e6edf3;font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;outline:none}
 .history-msg:focus{border-color:#58a6ff}
 .history-send{flex:none;width:40px;height:40px;border-radius:50%;border:0;background:#238636;color:#fff;font-size:18px;cursor:pointer}

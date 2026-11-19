@@ -1,7 +1,7 @@
 window.ButtonBar = (function(){
   const BUILTIN_BUTTONS = {
-    'enter':       { label:'ENT',    fn:()=>{ sendActive('\r'); resetTa(); } },
-    'tab':         { label:'Tab',    fn:()=>{ sendActive('\t'); resetTa(); } },
+    'enter':       { label:'ENT',    fn:()=>{ if(window.HistoryView && HistoryView.key('enter')) return; sendActive('\r'); resetTa(); } },
+    'tab':         { label:'Tab',    fn:()=>{ if(window.HistoryView && HistoryView.key('tab')) return; sendActive('\t'); resetTa(); } },
     'up':          { label:'&#8593;', fn:()=>{ sendActive('\x1b[A'); resetTa(); } },
     'down':        { label:'&#8595;', fn:()=>{ sendActive('\x1b[B'); resetTa(); } },
     'left':        { label:'&#8592;', fn:()=>{ sendActive('\x1b[D'); resetTa(); } },
@@ -147,7 +147,15 @@ window.ButtonBar = (function(){
       } else if(!b){
         const custom = customButtons.find(c => c.id === key);
         if(custom){
-          btns.push({ cls: '', label: custom.label, fn: () => { sendActive(custom.command); resetTa(); } });
+          btns.push({ cls: '', label: custom.label, fn: () => {
+            // HTML view: text goes into the message box rather than Claude's
+            // hidden prompt. A single key (`1` on a menu) or anything with
+            // control characters is a keystroke and still goes to Claude.
+            const c = custom.command;
+            const isText = Array.from(c).length > 1 && !/[\x00-\x1f\x7f]/.test(c);
+            if(isText && window.HistoryView && HistoryView.insert(c)) return;
+            sendActive(custom.command); resetTa();
+          } });
         }
       }
     }
