@@ -58,7 +58,9 @@
   ta.addEventListener('blur', ()=>{ composing = false; });
   window.resetInput = function(){
     composing = false; ta.value = ''; sent = '';
-    if(window.inputEnabled !== false) ta.focus();
+    // History open: a key on #ta would close it and reach Claude (Ctrl+C = ^C).
+    if(window.HistoryView && HistoryView.isOpen()) HistoryView.focus();
+    else if(window.inputEnabled !== false) ta.focus();
   };
   ta.addEventListener('input', ()=>{ if(!composing) rewrite(); });
 
@@ -227,7 +229,8 @@
     if(window.inputEnabled === false) return;   // keyboard locked off — don't refocus
     if(!e.target.closest('.btn') && !e.target.closest('.tab') && !e.target.closest('.tab-new-btn') &&
        !e.target.closest('.tab-scroll-btn') && !e.target.closest('#main-screen') &&
-       !e.target.closest('.modal-overlay') && !e.target.closest('.popout')){
+       !e.target.closest('.modal-overlay') && !e.target.closest('.popout') &&
+       !e.target.closest('#history-overlay')){   // keys there must not reach Claude
       ta.focus();
     }
   });

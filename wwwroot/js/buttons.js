@@ -13,9 +13,11 @@ window.ButtonBar = (function(){
     'ctrl-o':      { label:'^O',     fn:()=>{ sendActive('\x0f'); resetTa(); } },
     'clr':         { label:'CLR',    fn:()=>{ resetTa(); sendActive('/clear\r'); } },
     'cmpt':        { label:'CMPT',   fn:()=>{ resetTa(); sendActive('/compact\r'); } },
-    'scroll-up':   { label:'SCR &#8593;',  fn:()=>{ var t = getActiveTerm(); if(t) t.scrollLines(-Math.max(1, t.rows - 2)); }, minimizedOnly:true },
-    'scroll-down': { label:'SCR &#8595;',  fn:()=>{ var t = getActiveTerm(); if(t) t.scrollLines(Math.max(1, t.rows - 2)); }, minimizedOnly:true },
+    'scroll-up':   { label:'SCR &#8593;',  fn:()=>{ if(HistoryView.isOpen()) return HistoryView.scrollPage(-1); var t = getActiveTerm(); if(t) t.scrollLines(-Math.max(1, t.rows - 2)); }, minimizedOnly:true },
+    'scroll-down': { label:'SCR &#8595;',  fn:()=>{ if(HistoryView.isOpen()) return HistoryView.scrollPage(1); var t = getActiveTerm(); if(t) t.scrollLines(Math.max(1, t.rows - 2)); }, minimizedOnly:true },
     'reload':      { label:'&#8635;',  fn:()=>{ var tab = TabManager.getActive(); if(tab) Connection.hardRefresh(tab); }, minimizedOnly:true },
+    // Reflowable conversation history from Claude's own log (history.js).
+    'history':     { label:'HTML',   fn:()=>{ HistoryView.toggle(TabManager.getActive()); }, minimizedOnly:true },
     'model':       { label:'Model',  fn:showModelPopout, isPopout:true },
     'effort':      { label:'Effort', fn:showEffortPopout, isPopout:true },
   };
@@ -57,21 +59,44 @@ window.ButtonBar = (function(){
     }
     return true;
   }
+  // Submitted user prompts are echoed at column 0 as "> text" (❯ in newer builds);
+  // continuation lines are indented, so they never start at column 0.
+  const USER_PROMPT = /^[>❯] ?\S/;
+  // Walks from y in direction dir (-1 up, +1 down): true if a user prompt is
+  // reached before any other reply (tool calls between are fine). Walking down,
+  // running off the end of the buffer also counts (the latest reply so far).
+  function promptBeforeReply(buf, y, dir){
+    for(let i = y + dir, n = 0; i >= 0 && i < buf.length && n < 3000; i += dir, n++){
+      const l = buf.getLine(i);
+      if(!l || l.isWrapped) continue;
+      const s = l.translateToString(true);
+      if(USER_PROMPT.test(s)) return true;
+      if(BULLET.test(s) && isResponseStart(buf, i)) return false;
+    }
+    return dir > 0;
+  }
+  // A jump target is the first text reply after a user prompt, or the last one
+  // before the next prompt (the end-of-turn summary).
+  function isJumpTarget(buf, y){
+    return isResponseStart(buf, y) &&
+      (promptBeforeReply(buf, y, -1) || promptBeforeReply(buf, y, 1));
+  }
   // Jump targets land one line below the viewport top (one line of context above).
   function jumpToResponse(dir){
+    if(HistoryView.isOpen()) return HistoryView.jump(dir);
     const t = getActiveTerm();
     if(!t) return false;
     const buf = t.buffer.active;
     const top = buf.viewportY;
     if(dir < 0){
       for(let y = Math.min(top, buf.length - 1); y >= 0; y--){
-        if(isResponseStart(buf, y)){ t.scrollToLine(Math.max(0, y - 1)); return true; }
+        if(isJumpTarget(buf, y)){ t.scrollToLine(Math.max(0, y - 1)); return true; }
       }
       return false;
     }
     for(let y = top + 2; y < buf.length; y++){
       if(y - 1 > buf.baseY) break;           // already on the last screen
-      if(isResponseStart(buf, y)){ t.scrollToLine(y - 1); return true; }
+      if(isJumpTarget(buf, y)){ t.scrollToLine(y - 1); return true; }
     }
     t.scrollToBottom();
     return true;
@@ -89,7 +114,8 @@ window.ButtonBar = (function(){
     const buf = t.buffer.active;
     for(let y = 0; y < buf.length; y++){
       const s = lineText(buf, y);
-      if(/^\s*[●⏺]/.test(s)) console.log(y, isResponseStart(buf, y) ? 'RESP' : 'skip', JSON.stringify(s.slice(0, 80)));
+      if(USER_PROMPT.test(s)) console.log(y, 'USER', JSON.stringify(s.slice(0, 80)));
+      else if(/^\s*[●⏺]/.test(s)) console.log(y, isJumpTarget(buf, y) ? 'JUMP' : isResponseStart(buf, y) ? 'resp' : 'skip', JSON.stringify(s.slice(0, 80)));
     }
   };
 
@@ -142,6 +168,20 @@ window.ButtonBar = (function(){
           row.appendChild(jumpBtn(key === 'scroll-up' ? -1 : 1));
           row.appendChild(makeBtn('', b.label, b.fn));
           blist.appendChild(row);
+        } else if(key === 'reload'){
+          // Pin (left of reload): keeps an entry in view: Claude's prompt box
+          // when the terminal is scrolled up, a message box in the history.
+          const row = document.createElement('div');
+          row.className = 'brow';
+          const pin = makeBtn('jump pin' + (HistoryView.isPinned() ? ' on' : ''), '&#128204;',
+            () => HistoryView.togglePin());
+          pin.title = 'Pin the entry: Claude\'s prompt when scrolled up, a message box in history';
+          row.appendChild(pin);
+          row.appendChild(makeBtn('', b.label, b.fn));
+          blist.appendChild(row);
+        } else if(key === 'history'){
+          // Names the view it switches to: HTML (history) from the terminal, TEXT back.
+          blist.appendChild(makeBtn('hist', HistoryView.isOpen() ? 'TEXT' : 'HTML', b.fn));
         } else {
           blist.appendChild(makeBtn('', b.label, b.fn));
         }

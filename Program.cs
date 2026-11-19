@@ -429,6 +429,35 @@ app.MapDelete("/api/sessions/{sid}", (string sid) =>
     return Results.Ok(new { closed = sid });
 });
 
+// Claude's own conversation log for a tab, distilled to display entries, so the
+// browser can show history that reflows to any width (the PTY replay is laid
+// out for the width it was produced at). Incremental: `from` is the byte offset
+// a previous call returned for `path`; a different path (or none) reads from 0.
+app.MapGet("/api/transcript/{sid}", (string sid, HttpContext ctx) =>
+{
+    if (!sessions.TryGetValue(sid, out var session))
+        return Results.NotFound(new { error = "Session not found" });
+
+    var claimed = new HashSet<string>(
+        sessions.Where(kv => kv.Key != sid).Select(kv => kv.Value.ClaimedTranscript).OfType<string>(),
+        StringComparer.OrdinalIgnoreCase);
+    var path = session.TranscriptPath(claimed);
+    if (path == null)
+        return Results.Json(new { path = (string?)null, offset = 0L, reset = false, items = Array.Empty<TranscriptItem>() }, Transcript.JsonOpts);
+
+    var from = long.TryParse(ctx.Request.Query["from"].ToString(), out var f) ? f : 0;
+    if (!string.Equals(ctx.Request.Query["path"].ToString(), path, StringComparison.OrdinalIgnoreCase)) from = 0;
+    try
+    {
+        var (offset, items, restarted) = Transcript.Read(path, from);
+        return Results.Json(new { path, offset, reset = from == 0 || restarted, items }, Transcript.JsonOpts);
+    }
+    catch (IOException ex)
+    {
+        return Results.Json(new { error = ex.Message }, statusCode: 503);
+    }
+});
+
 app.MapGet("/api/file/{id}", (string id) =>
 {
     if (!pendingFiles.TryGetValue(id, out var path) || !File.Exists(path))
@@ -550,6 +579,26 @@ app.MapPost("/api/notify", async (HttpContext ctx) =>
         return;
     }
 
+    // A Claude started inside the tab (e.g. `claude -p` from its Bash tool)
+    // inherits WEBTERM_SID, so its hooks would repoint the tab's history at its
+    // own log and fire idle/attention for the tab. Drop those.
+    if (sessions.TryGetValue(sid, out var nsess) && IsNestedClaude(body, nsess.Pty?.Pid))
+    {
+        Log($"NOTIFY sid={sid[..Math.Min(8, sid.Length)]}… event={evt} ignored (nested Claude)");
+        return;
+    }
+
+    // Every hook passes the conversation log's path (it changes on /clear), so
+    // /api/transcript serves the exact file instead of guessing.
+    var transcript = body.TryGetProperty("transcript", out var tp) && tp.ValueKind == JsonValueKind.String ? tp.GetString() : null;
+    if (Transcript.IsValidPath(transcript) && sessions.TryGetValue(sid, out var tsess))
+        tsess.SetTranscript(Path.GetFullPath(transcript!));
+    if (evt == "session_start")
+    {
+        Log($"NOTIFY sid={sid[..Math.Min(8, sid.Length)]}… event={evt}");
+        return;
+    }
+
     var sseEvent = evt switch
     {
         "permission_request" => "tab_attention",
@@ -561,6 +610,28 @@ app.MapPost("/api/notify", async (HttpContext ctx) =>
     BroadcastSse(sseEvent, new { sid, @event = evt });
     Log($"NOTIFY sid={sid[..Math.Min(8, sid.Length)]}… event={evt}");
 });
+
+// The hook sends its process ancestry (`chain`: [{pid, name}], nearest first).
+// The tab's own Claude is the only claude.exe/node.exe between the hook and
+// the PTY's process (which may itself be claude.exe/node.exe when spawned
+// directly); a second one means a Claude launched from inside the tab. No
+// chain (older hook script) or the PTY not found in it: not nested.
+static bool IsNestedClaude(JsonElement body, int? ptyPid)
+{
+    if (ptyPid is not int root || !body.TryGetProperty("chain", out var chain) || chain.ValueKind != JsonValueKind.Array)
+        return false;
+    var claudes = 0;
+    foreach (var p in chain.EnumerateArray())
+    {
+        if (p.ValueKind != JsonValueKind.Object) return false;
+        var name = p.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String ? n.GetString() : null;
+        if (string.Equals(name, "claude.exe", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, "node.exe", StringComparison.OrdinalIgnoreCase)) claudes++;
+        if (p.TryGetProperty("pid", out var pid) && pid.ValueKind == JsonValueKind.Number
+            && pid.TryGetInt32(out var v) && v == root) return claudes > 1;
+    }
+    return false;
+}
 
 app.MapPost("/api/mcp-setup", () =>
 {
@@ -589,10 +660,27 @@ app.MapPost("/api/mcp-setup", () =>
         if (-not $sid -or -not $token) { exit 0 }
         $eventType = $args[0]
         if (-not $eventType) { exit 0 }
-        $body = "{`"sid`":`"$sid`",`"event`":`"$eventType`"}"
+        # Claude passes the hook's JSON on stdin; its transcript_path lets WebTerm show this conversation's history.
+        $transcript = $null
+        try { [Console]::InputEncoding = [Text.Encoding]::UTF8 } catch {}
+        try { $transcript = ([Console]::In.ReadToEnd() | ConvertFrom-Json).transcript_path } catch {}
+        # Process ancestry, nearest first: lets WebTerm ignore a Claude started inside the tab (it inherits WEBTERM_SID).
+        $chain = @()
+        try {
+            $procs = @{}
+            Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name | ForEach-Object { $procs[[int]$_.ProcessId] = $_ }
+            $p = $PID
+            for ($i = 0; $i -lt 16 -and $procs.ContainsKey($p); $i++) {
+                $x = $procs[$p]
+                $chain += @{ pid = $p; name = $x.Name }
+                if ([int]$x.ParentProcessId -eq $p) { break }
+                $p = [int]$x.ParentProcessId
+            }
+        } catch {}
+        $body = [Text.Encoding]::UTF8.GetBytes((@{ sid = $sid; event = $eventType; transcript = $transcript; chain = $chain } | ConvertTo-Json -Compress -Depth 4))
         try {
             # Loopback-only HTTP port: token never hits the wire, so no TLS / cert handling needed (works on Windows PowerShell 5.1).
-            Invoke-RestMethod -Uri "http://127.0.0.1:{{LoopbackHttpPort}}/api/notify" -Method POST -Headers @{ Authorization = "Bearer $token" } -Body $body -ContentType 'application/json' -TimeoutSec 2 2>$null | Out-Null
+            Invoke-RestMethod -Uri "http://127.0.0.1:{{LoopbackHttpPort}}/api/notify" -Method POST -Headers @{ Authorization = "Bearer $token" } -Body $body -ContentType 'application/json; charset=utf-8' -TimeoutSec 2 2>$null | Out-Null
         } catch {}
         """);
 
@@ -614,7 +702,7 @@ app.MapPost("/api/mcp-setup", () =>
 
         var hookCmd = $"powershell.exe -ExecutionPolicy Bypass -File \"{hookScriptPath}\"";
 
-        void AddHookIfMissing(string eventName, string arg)
+        void AddHookIfMissing(string eventName, string arg, string? matcher = "*")
         {
             var fullCmd = $"{hookCmd} {arg}";
             var arr = hooksObj[eventName]?.AsArray();
@@ -634,9 +722,8 @@ app.MapPost("/api/mcp-setup", () =>
                 arr = new JsonArray();
                 hooksObj[eventName] = arr;
             }
-            arr.Add(new JsonObject
+            var entry = new JsonObject
             {
-                ["matcher"] = "*",
                 ["hooks"] = new JsonArray
                 {
                     new JsonObject
@@ -646,11 +733,17 @@ app.MapPost("/api/mcp-setup", () =>
                         ["timeout"] = 10
                     }
                 }
-            });
+            };
+            if (matcher != null) entry["matcher"] = matcher;
+            arr.Add(entry);
         }
 
         AddHookIfMissing("PermissionRequest", "permission_request");
         AddHookIfMissing("Stop", "stop");
+        // No matcher: SessionStart matches on its source (startup/resume/clear/compact),
+        // and every source can start a new log file. The script prints nothing,
+        // so it adds nothing to Claude's context.
+        AddHookIfMissing("SessionStart", "session_start", null);
 
         File.WriteAllText(claudeSettingsPath, claudeSettings.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
         Log("Claude hooks configured for WebTerm notifications");
@@ -1226,6 +1319,13 @@ sealed class Session : IDisposable
     string? _label;
     string? _color;
     string? _projectId;
+    // Where the process runs and when it started: lets /api/transcript find
+    // Claude's conversation log when no hook has reported it.
+    string? _cwd;
+    DateTime _launchedUtc;
+    // Claude's .jsonl conversation log: reported by the webterm-notify hook
+    // (exact), else guessed from the cwd's project folder (sticky, see Transcript.Guess).
+    string? _transcript, _transcriptGuess;
 
     public static Session Create(string? kind = null, string? label = null, string? color = null, string? projectId = null)
         => new Session { _kind = kind, _label = label, _color = color, _projectId = projectId };
@@ -1253,6 +1353,25 @@ sealed class Session : IDisposable
     public string? ProjectId { get { lock (_lock) return _projectId; } }
     public bool HasWebSocket { get { lock (_lock) return _att != null; } }
     public bool PtyExited { get { lock (_lock) return _ptyExited; } }
+    // The log this session shows: reported, else its current guess. Other tabs
+    // exclude it from their guesses, so two Claude tabs in one project folder
+    // don't both claim the same file.
+    public string? ClaimedTranscript { get { lock (_lock) return _transcript ?? _transcriptGuess; } }
+
+    public void SetTranscript(string path) { lock (_lock) _transcript = path; }
+
+    /// <summary>The session's Claude conversation log, or null if none can be found yet.</summary>
+    public string? TranscriptPath(ISet<string> claimedElsewhere)
+    {
+        string? cwd, reported, guess, kind;
+        DateTime launched;
+        lock (_lock) { cwd = _cwd; reported = _transcript; guess = _transcriptGuess; launched = _launchedUtc; kind = _kind; }
+        if (reported != null && File.Exists(reported)) return reported;
+        if (cwd == null || kind == "powershell") return null;
+        guess = Transcript.Guess(cwd, launched, guess, claimedElsewhere);
+        lock (_lock) _transcriptGuess = guess;
+        return guess;
+    }
 
     public void Launch(string kind, string? projectId, SettingsManager sm, string sid, string sidShort, Action<string> log, string? defaultCommand = null)
     {
@@ -1300,6 +1419,7 @@ sealed class Session : IDisposable
             }
         }
 
+        lock (_lock) { _cwd = cwd; _launchedUtc = DateTime.UtcNow; }
         log($"SESSION LAUNCH sid={sidShort}… kind={kind} cwd={cwd}");
 
         var env = new Dictionary<string, string>();

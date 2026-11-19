@@ -117,6 +117,92 @@ body.has-tabs #banner{top:37px}
 .copy-preview{width:100%;height:min(40vh,240px);resize:vertical;padding:8px 10px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;font:13px monospace;box-sizing:border-box;white-space:pre;overflow:auto}
 .copy-meta{color:#8b949e;font:12px monospace}
 .copy-box .modal-actions{margin-top:4px}
+
+/* History overlay (history.js): Claude's conversation log as reflowing HTML.
+   Above the terminal and #ta (10), below the button bar (20) so HIST still toggles it. */
+#history-overlay{position:fixed;left:0;right:0;top:0;height:100dvh;z-index:15;background:#0d1117;color:#c9d1d9;display:none;flex-direction:column}
+body.has-tabs #history-overlay{top:37px;height:calc(100dvh - 37px)}
+#history-overlay.show{display:flex}
+.history-head{display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid #21262d;font:13px monospace;flex:none}
+.history-title{color:#e6edf3;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.history-status{color:#d29922;flex:1}
+.history-close{width:30px;height:30px;border-radius:50%;border:1px solid #30363d;background:#161b22;color:#c9d1d9;font:18px monospace;line-height:1;cursor:pointer;flex:none}
+.history-body{flex:1;display:flex;flex-direction:column;overflow-y:auto;-webkit-overflow-scrolling:touch;padding:12px 84px 24px 16px;font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif;user-select:text;-webkit-user-select:text;overflow-wrap:anywhere}
+@media (max-width:600px){.history-body{padding:10px 72px 24px 10px;font-size:14px}}
+/* Body is a flex column so the message box (margin-top:auto) sits at the
+   bottom of the view even when the conversation is shorter than the view. */
+.history-body>*{flex-shrink:0}
+.history-body>.h-menu{margin-top:auto}
+.h-menu+.history-input{margin-top:0}
+.history-list{display:flex;flex-direction:column;padding-bottom:4px}
+.history-list:empty::before{content:attr(data-empty);color:#8b949e;font-style:italic}
+.history-list>*{margin:0 0 10px;max-width:100%}
+/* Chat bubbles: user on the right, Claude on the left; tool rows, commands
+   and notes sit between them unbubbled. */
+.h-user{align-self:flex-end;max-width:85%;white-space:pre-wrap;background:#1f3a5f;color:#e6edf3;border-radius:16px 16px 4px 16px;padding:8px 12px;margin-top:6px}
+.history-list>.h-assistant{align-self:flex-start;max-width:95%;background:#161b22;border:1px solid #21262d;border-radius:16px 16px 16px 4px;padding:10px 14px}
+.history-list>.h-assistant>:last-child{margin-bottom:0}
+/* Claude's interactive menu (approval, --resume picker, /model), mirrored from the terminal screen. */
+.h-menu{border:1px solid #d29922;border-radius:10px;background:#161b22;padding:10px;margin:6px 0 12px;font:13px/1.45 monospace}
+.h-menu.busy{opacity:.55;pointer-events:none}
+.h-menu-q{white-space:pre-wrap;color:#e6edf3;margin-bottom:8px}
+.h-menu-list{position:relative;display:flex;flex-direction:column;gap:4px;max-height:50vh;overflow-y:auto}
+.h-opt{text-align:left;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;padding:7px 10px;font:inherit;cursor:pointer;white-space:pre-wrap;overflow-wrap:anywhere;flex:none}
+.h-opt:hover{border-color:#58a6ff}
+.h-opt.sel{border-color:#d29922;background:#2d2208;color:#e6edf3}
+.h-opt-sub{display:block;color:#8b949e;font-size:12px}
+.h-menu-keys{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.h-opt-text{border-style:dashed}
+.h-opt-input{display:flex;gap:6px;flex:none}
+.h-opt-input input{flex:1;min-width:0;background:#0d1117;border:1px solid #58a6ff;border-radius:6px;color:#e6edf3;padding:7px 10px;font:inherit;outline:none}
+.h-opt-input button{width:40px;border:1px solid #30363d;border-radius:6px;background:#238636;color:#fff;font:15px monospace;cursor:pointer}
+.h-menu-hint{margin-top:6px;color:#8b949e;font-size:12px}
+.h-menu-keys button{min-width:44px;height:32px;padding:0 10px;border:1px solid #30363d;border-radius:6px;background:#21262d;color:#c9d1d9;font:13px monospace;cursor:pointer}
+.history-list>.h-tool,.history-list>.h-note,.history-list>.h-out{margin-left:12px;margin-right:12px}
+.h-assistant .h-code{background:#0d1117}
+.h-assistant p{margin:0 0 8px}
+.h-assistant h1,.h-assistant h2,.h-assistant h3,.h-assistant h4,.h-assistant h5,.h-assistant h6{margin:12px 0 6px;font-size:1.05em;color:#e6edf3}
+.h-assistant ul,.h-assistant ol{margin:0 0 8px;padding-left:22px}
+.h-assistant li.h-sub{margin-left:18px}
+.h-assistant blockquote{margin:0 0 8px;padding-left:10px;border-left:3px solid #30363d;color:#8b949e}
+.h-assistant hr{border:0;border-top:1px solid #30363d}
+.h-assistant a{color:#58a6ff}
+.h-assistant code{font:13px monospace;background:#161b22;border-radius:4px;padding:1px 4px}
+.h-code,.h-out,.h-input,.h-result{font:13px/1.45 monospace;background:#161b22;border:1px solid #21262d;border-radius:6px;padding:8px 10px;margin:4px 0 8px;white-space:pre-wrap;overflow-wrap:anywhere}
+.h-code code{background:none;padding:0}
+.h-table{overflow-x:auto;margin:0 0 8px}
+.h-table table{border-collapse:collapse;font-size:14px}
+.h-table th,.h-table td{border:1px solid #30363d;padding:4px 8px;text-align:left;vertical-align:top}
+.h-note{color:#8b949e;font-style:italic;font-size:13px;text-align:center}
+.h-tool,.h-compact{font-size:13px;color:#8b949e}
+.h-tool summary,.h-compact summary{cursor:pointer;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;list-style:none}
+.h-tool summary::-webkit-details-marker,.h-compact summary::-webkit-details-marker{display:none}
+.h-tool summary::before,.h-compact summary::before{content:'\25B8  ';color:#8b949e}
+.h-tool[open]>summary::before,.h-compact[open]>summary::before{content:'\25BE  '}
+.h-tool[open]>summary,.h-compact[open]>summary{position:sticky;top:0;z-index:1;background:#0d1117;padding:2px 0}
+.h-tool summary b{color:#3fb950;font-weight:600}
+.h-tool.err summary b,.h-result.err{color:#f85149}
+/* Message box: the last item in .history-body (after the conversation).
+   Negative margins span the body's padding so a pinned bar covers the full
+   width; pinned it sticks to the bottom of the view, otherwise it scrolls.
+   It spans to the right edge: the button column ends above it while it is on
+   screen (history.js clampButtons). */
+.history-input{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;margin:auto -84px -24px -16px;padding:8px 12px calc(8px + env(safe-area-inset-bottom,0px)) 12px;border-top:1px solid #21262d;background:#0d1117}
+@media (max-width:600px){.history-input{margin:auto -72px -24px -10px;padding-right:8px;padding-left:8px}}
+.btnbar.clamped{overflow-y:auto;overflow-x:hidden;scrollbar-width:none}
+.btnbar.clamped::-webkit-scrollbar{display:none}
+.history-input.pinned{position:sticky;bottom:-24px;z-index:1}
+.history-working{display:none;flex:0 0 100%;font:13px monospace;color:#d29922;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.history-working.show{display:block}
+.history-msg{flex:1;resize:none;min-height:62px;max-height:40vh;overflow-y:auto;box-sizing:border-box;padding:9px 12px;border-radius:18px;border:1px solid #30363d;background:#161b22;color:#e6edf3;font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;outline:none}
+.history-msg:focus{border-color:#58a6ff}
+.history-send{flex:none;width:40px;height:40px;border-radius:50%;border:0;background:#238636;color:#fff;font-size:18px;cursor:pointer}
+/* Pinned terminal entry: Claude's prompt box, copied from the bottom of the
+   terminal while scrolling up has cut it off (history.js updateStrip). */
+.term-entry-strip{position:fixed;left:0;right:0;bottom:0;z-index:14;margin:0;padding:4px 0 calc(4px + env(safe-area-inset-bottom,0px));border-top:1px solid #30363d;color:#c9d1d9;line-height:1.2;white-space:pre;overflow:hidden;cursor:pointer;display:none;box-shadow:0 -4px 12px rgba(0,0,0,.5)}
+.term-entry-strip.show{display:block}
+.term-entry-strip .cur{background:#c9d1d9;color:#0d1117}
+.btn.pin.on{opacity:0.95;border-color:#58a6ff;background:#1f3a5f}
 .modal-overlay{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,0.8);display:none;align-items:center;justify-content:center;padding:20px}
 .modal-overlay.visible{display:flex}
 .modal-card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:24px;max-width:420px;width:100%;box-sizing:border-box}

@@ -70,6 +70,7 @@ window.TabManager = (function(){
     }
     activeIndex = index;
     const tab = tabs[activeIndex];
+    if(window.HistoryView) HistoryView.hide();   // it shows the previous tab's conversation
     tab.attention = null;
     tab.containerEl.classList.add('active');
 
@@ -88,7 +89,10 @@ window.TabManager = (function(){
 
     setTimeout(() => {
       Connection.forceResize(tab);
-      ta.focus();
+      if(tabs[activeIndex] !== tab) return;
+      // Claude tabs open in the history (HTML) view unless switched to TEXT.
+      if(window.HistoryView) HistoryView.restore(tab);
+      if(!window.HistoryView || !HistoryView.isOpen()) ta.focus();
     }, 50);
 
     saveTabs();
@@ -183,6 +187,7 @@ window.TabManager = (function(){
   });
 
   function showMainScreen(){
+    if(window.HistoryView) HistoryView.hide();
     document.getElementById('main-screen').style.display = 'flex';
     document.getElementById('btn-back-to-session').style.display = tabs.length > 0 ? '' : 'none';
     if(typeof MainScreen !== 'undefined' && MainScreen.refresh) MainScreen.refresh();

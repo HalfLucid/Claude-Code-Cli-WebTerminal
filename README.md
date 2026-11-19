@@ -10,6 +10,9 @@ ASP.NET Core minimal API backend + xterm.js frontend. Connects your browser to a
 - **Multi-tab** — run multiple shells or Claude Code instances side by side with a tabbed interface.
 - **Claude Code integration** — launch Claude Code directly into any configured project directory. Open new or resume existing sessions.
 - **Mobile-friendly** — touch-optimized button overlay with configurable keys (Enter, arrows, Ctrl combos, Esc, Tab, etc.) and paginated layout.
+- **HTML chat view** — an alternative to the raw terminal for Claude tabs (and their default view). It renders the conversation as chat bubbles that reflow to any screen width, so text printed on a narrow phone reads properly on a wide monitor. Tool calls collapse into expandable rows, and Claude's interactive prompts (approvals, the `--resume` picker, `/model`, multiple-choice questions) appear as tappable buttons. A message box at the bottom sends to Claude (Tab takes Claude's suggested next prompt, as in the terminal), and the TEXT button switches back to the live terminal at any time.
+- **Pin-to-bottom input** — the 📌 button keeps a place to type in view while you scroll back, in both views. In the terminal, a strip at the bottom mirrors Claude's prompt box once scrolling has pushed it off screen; in the HTML view, the message box stays fixed at the bottom.
+- **Jump-to-response buttons** — `●↑` / `●↓` beside the scroll buttons skip straight to Claude's first reply after each of your prompts and its end-of-turn summary, passing over tool calls and progress chatter in between. They work in both the terminal and the HTML view.
 - **Native text input** — uses a virtual text entry layer that preserves your device's autocomplete, swipe typing, dictation, and IME support. Edits are transparently bridged to the PTY, so the full mobile keyboard experience works naturally in the terminal.
 - **Session ring buffer** — 256KB buffer replays recent output on reconnect so you never lose context.
 - **Server-sourced session registry** — tab state lives on the server, not in localStorage. Any browser connecting sees all active sessions. Cross-device by default.
@@ -52,6 +55,11 @@ Paginated button overlay for touch input — arrow keys, Ctrl combos, Enter, and
 
 ![Mobile Buttons](docs/screenshots/mobileScreenshotExpandedButtons.png)
 
+### HTML Chat View
+Claude's conversation as reflowing chat bubbles, with collapsible tool calls (an expanded `Grep` call is shown here with its input and result). The button column has the jump-to-response buttons (`●↑` / `●↓`), the 📌 pin, and TEXT to switch back to the terminal. The message box sends straight to Claude.
+
+![HTML Chat View](docs/screenshots/htmlChatView.png)
+
 ## Requirements
 
 - Windows (uses `powershell.exe` and Windows DPAPI for credential storage)
@@ -73,7 +81,9 @@ On first run you'll be prompted to set a username and password. After setup, the
 2. **Claude Code** — add a project (name + directory), then use "Open Claude" or "Resume Claude"
 3. **Tabs** — use the `+` button to open more sessions, click tabs to switch
 4. **Mobile** — tap the arrow button on the right edge to expand the button overlay for touch-friendly input
-5. **Remote access** — access from other devices on your network at `https://<your-ip>:7681` (works great with Tailscale)
+5. **HTML / TEXT view** — Claude tabs open in the HTML chat view; the HTML/TEXT button (or Esc) toggles between it and the raw terminal, and each tab remembers its choice
+6. **Navigating long output** — `●↑` / `●↓` jump between Claude's replies and turn summaries; 📌 keeps the input box visible while you scroll
+7. **Remote access** — access from other devices on your network at `https://<your-ip>:7681` (works great with Tailscale)
 
 ## Custom Buttons
 

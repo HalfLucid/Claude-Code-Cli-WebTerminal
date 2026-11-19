@@ -97,6 +97,7 @@ window.MainScreen = (function(){
     var active = TabManager.getActive();
     if(active){
       TabManager.hideMainScreen();
+      HistoryView.restore(active);
     } else if(TabManager.getAll().length > 0){
       TabManager.switchTo(0);
     }
