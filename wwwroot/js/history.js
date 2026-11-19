@@ -871,7 +871,7 @@ window.HistoryView = (function(){
         return;
       }
       const stick = first || bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight < 40;
-      if(d.reset){ st.el.replaceChildren(); st.tools = {}; }
+      if(d.reset){ st.el.replaceChildren(); st.tools = {}; st.files = {}; }
       st.path = d.path;
       st.sid = tab.sid;
       st.offset = d.offset;
@@ -941,6 +941,39 @@ window.HistoryView = (function(){
         host.appendChild(img);
         break;
       }
+      // A file Claude showed with show_file: visible after the call (which
+      // stays collapsed), an image as a thumbnail, video/audio as a player.
+      // Hidden until the call's result arrives without an error, so a call the
+      // user denied never shows its file (the server checks the same).
+      case 'file': {
+        const at = String(it.img || '').split(':');
+        const src = '/api/transcript/' + encodeURIComponent(st.sid) + '/file?path=' + encodeURIComponent(st.path) +
+          '&at=' + encodeURIComponent(at[0]) + '&n=' + encodeURIComponent(at[1] || '0');
+        const row = st.el.appendChild(div('h-media'));
+        row.hidden = true;
+        const name = it.name || 'file';
+        let el;
+        if(it.media === 'image'){
+          el = document.createElement('img');
+          el.className = 'h-img';
+          el.loading = 'lazy';
+          el.alt = name;
+          el.title = name;
+          el.addEventListener('click', e => { e.preventDefault(); if(window.showImage) showImage(src, name); });
+        } else {
+          el = document.createElement(it.media === 'audio' ? 'audio' : 'video');
+          el.className = 'h-av';
+          el.controls = true;
+          el.preload = 'none';
+        }
+        // Gone, or just a network blip: say so, and retry on a tap.
+        const note = div('h-note h-retry', name + ' (could not load, tap to retry)');
+        note.addEventListener('click', () => { note.replaceWith(el); el.src = src; });
+        el.addEventListener('error', () => el.replaceWith(note));
+        row.appendChild(el);
+        (st.files ||= {})[it.id] = { row, show(){ row.hidden = false; el.src = src; } };
+        break;
+      }
       case 'compact': {
         const d = document.createElement('details');
         d.className = 'h-compact';
@@ -980,6 +1013,11 @@ window.HistoryView = (function(){
           s.textContent = 'Tool result';
           d.append(s, res);
           st.el.appendChild(d);
+        }
+        const file = it.id && st.files && st.files[it.id];
+        if(file){
+          delete st.files[it.id];
+          if(it.err) file.row.remove(); else file.show();
         }
         break;
       }

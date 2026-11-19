@@ -7,9 +7,11 @@ using System.Text.RegularExpressions;
 /// One display entry of a Claude conversation, distilled from its .jsonl log.
 /// K: user | assistant | cmd | out | tool | result | compact | note | image.
 /// An image carries Img = "&lt;line offset&gt;:&lt;index&gt;" (see <see cref="Transcript.Image"/>)
-/// and, inside a tool result, the tool call's Id.
+/// and, inside a tool result, the tool call's Id. A file (shown with WebTerm's
+/// show_file tool) carries Img = "&lt;line offset&gt;:&lt;index&gt;" (see
+/// <see cref="Transcript.ShownFile"/>), its file Name and Media (image | video | audio).
 /// </summary>
-sealed record TranscriptItem(string K, string? Text = null, string? Name = null, string? Arg = null, string? Id = null, bool? Err = null, string? Img = null);
+sealed record TranscriptItem(string K, string? Text = null, string? Name = null, string? Arg = null, string? Id = null, bool? Err = null, string? Img = null, string? Media = null);
 
 /// <summary>
 /// Reads the conversation log Claude Code writes for every session
@@ -176,8 +178,28 @@ static class Transcript
     /// </summary>
     public static (byte[] Data, string MediaType)? Image(string path, long at, int index)
     {
+        if (index < 0 || ReadLineAt(path, at) is not { } line) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            if (!doc.RootElement.TryGetProperty("message", out var m) || m.ValueKind != JsonValueKind.Object
+                || !m.TryGetProperty("content", out var c)) return null;
+            var b = ImageBlocks(c).ElementAtOrDefault(index);
+            if (!b.TryGetProperty("source", out var s) || Str(s, "type") != "base64") return null;
+            var mediaType = Str(s, "media_type");
+            var data = Str(s, "data");
+            if (data == null || mediaType == null || !ImageTypes.Contains(mediaType)) return null;
+            return (Convert.FromBase64String(data), mediaType.ToLowerInvariant());
+        }
+        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException) { return null; }
+    }
+
+    // The log line starting at byte `at` (without its newline); null past the
+    // end or over MaxImageLine.
+    static ReadOnlyMemory<byte>? ReadLineAt(string path, long at)
+    {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        if (at < 0 || at >= fs.Length || index < 0) return null;
+        if (at < 0 || at >= fs.Length) return null;
         fs.Seek(at, SeekOrigin.Begin);
         var line = new MemoryStream();
         var buf = new byte[1 << 16];
@@ -189,19 +211,116 @@ static class Transcript
             if (nl >= 0) break;
             if (line.Length > MaxImageLine) return null;
         }
+        return line.GetBuffer().AsMemory(0, (int)line.Length);
+    }
+
+    // WebTerm's own MCP tool, as `claude mcp add webterm` (POST /api/mcp-setup) names it.
+    const string ShowFileTool = "mcp__webterm__show_file";
+
+    // An assistant message's show_file calls, in order: (line offset, index) finds one again.
+    static IEnumerable<JsonElement> ShowFileCalls(JsonElement c) =>
+        c.ValueKind == JsonValueKind.Array
+            ? c.EnumerateArray().Where(b => Str(b, "type") == "tool_use" && Str(b, "name") == ShowFileTool)
+            : [];
+
+    /// <summary>
+    /// What the history view can play inline: image | video | audio, by
+    /// extension; null otherwise. Raster images only: an SVG served
+    /// same-origin could run script.
+    /// </summary>
+    public static string? MediaKind(string path) => Path.GetExtension(path).ToLowerInvariant() switch
+    {
+        ".png" or ".jpg" or ".jpeg" or ".gif" or ".webp" or ".bmp" => "image",
+        ".mp4" or ".webm" or ".mov" or ".m4v" or ".mkv" => "video",
+        ".mp3" or ".wav" or ".ogg" or ".m4a" or ".flac" => "audio",
+        _ => null
+    };
+
+    /// <summary>
+    /// The absolute path passed to the <paramref name="index"/>th show_file call
+    /// of the log line starting at byte <paramref name="at"/>; null if there is
+    /// none, or the call hasn't succeeded (denied, failed, or still running), so
+    /// a file the user declined to show is never served.
+    /// </summary>
+    public static string? ShownFile(string path, long at, int index)
+    {
+        if (index < 0 || ReadLineAt(path, at) is not { } line) return null;
         try
         {
-            using var doc = JsonDocument.Parse(line.GetBuffer().AsMemory(0, (int)line.Length));
-            if (!doc.RootElement.TryGetProperty("message", out var m) || m.ValueKind != JsonValueKind.Object
-                || !m.TryGetProperty("content", out var c)) return null;
-            var b = ImageBlocks(c).ElementAtOrDefault(index);
-            if (!b.TryGetProperty("source", out var s) || Str(s, "type") != "base64") return null;
-            var mediaType = Str(s, "media_type");
-            var data = Str(s, "data");
-            if (data == null || mediaType == null || !ImageTypes.Contains(mediaType)) return null;
-            return (Convert.FromBase64String(data), mediaType.ToLowerInvariant());
+            string? id, file;
+            using (var doc = JsonDocument.Parse(line))
+            {
+                var o = doc.RootElement;
+                if (Str(o, "type") != "assistant" || Bool(o, "isSidechain")
+                    || !o.TryGetProperty("message", out var m) || m.ValueKind != JsonValueKind.Object
+                    || !m.TryGetProperty("content", out var c)) return null;
+                var b = ShowFileCalls(c).ElementAtOrDefault(index);
+                if (b.ValueKind != JsonValueKind.Object || !b.TryGetProperty("input", out var input)) return null;
+                id = Str(b, "id");
+                file = Str(input, "path");
+            }
+            if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(file)) return null;
+            return Succeeded(path, at + line.Length + 1, id) ? Path.GetFullPath(file) : null;
         }
-        catch (Exception ex) when (ex is JsonException or FormatException or InvalidOperationException) { return null; }
+        catch (Exception ex) when (ex is JsonException or ArgumentException or NotSupportedException or PathTooLongException) { return null; }
+    }
+
+    // How far past a call its result is looked for. Claude logs the result
+    // right after the call (parallel calls and progress lines in between), so
+    // this only bounds the scan for a call that never got one.
+    const int MaxResultScan = 16 << 20;
+
+    // Whether a tool_result for call `id` without is_error follows byte `from`.
+    // Lines are only parsed when they contain the id.
+    static bool Succeeded(string path, long from, string id)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        if (from >= fs.Length) return false;
+        fs.Seek(from, SeekOrigin.Begin);
+        var needle = Encoding.UTF8.GetBytes(id);
+        var buf = new byte[1 << 16];
+        var partial = new MemoryStream();
+        long scanned = 0;
+        int n;
+        while (scanned < MaxResultScan && (n = fs.Read(buf, 0, buf.Length)) > 0)
+        {
+            scanned += n;
+            var start = 0;
+            int nl;
+            while ((nl = Array.IndexOf(buf, (byte)'\n', start, n - start)) >= 0)
+            {
+                ReadOnlySpan<byte> l;
+                if (partial.Length > 0)
+                {
+                    partial.Write(buf, start, nl - start);
+                    l = partial.GetBuffer().AsSpan(0, (int)partial.Length);
+                }
+                else l = buf.AsSpan(start, nl - start);
+                if (l.IndexOf(needle) >= 0 && ResultFor(l, id) is { } ok) return ok;
+                partial.SetLength(0);
+                start = nl + 1;
+            }
+            if (start < n) partial.Write(buf, start, n - start);
+        }
+        return false;
+    }
+
+    // A user line's tool_result for call `id`: true if it succeeded, false if
+    // it is an error, null if the line has none.
+    static bool? ResultFor(ReadOnlySpan<byte> line, string id)
+    {
+        try
+        {
+            var reader = new Utf8JsonReader(line);
+            using var doc = JsonDocument.ParseValue(ref reader);
+            var o = doc.RootElement;
+            if (Str(o, "type") != "user" || !o.TryGetProperty("message", out var m) || m.ValueKind != JsonValueKind.Object
+                || !m.TryGetProperty("content", out var c) || c.ValueKind != JsonValueKind.Array) return null;
+            foreach (var b in c.EnumerateArray())
+                if (Str(b, "type") == "tool_result" && Str(b, "tool_use_id") == id) return !Bool(b, "is_error");
+            return null;
+        }
+        catch (JsonException) { return null; }
     }
 
     static void Process(JsonElement o, long at, List<TranscriptItem> items)
@@ -252,6 +371,7 @@ static class Transcript
 
         if (c.ValueKind == JsonValueKind.String) { AddAssistant(c.GetString()!, items); return; }
         if (c.ValueKind != JsonValueKind.Array) return;
+        var shown = 0;   // counts in ShowFileCalls order
         foreach (var b in c.EnumerateArray())
         {
             switch (Str(b, "type"))
@@ -260,8 +380,18 @@ static class Transcript
                 case "tool_use":
                 case "server_tool_use":
                     b.TryGetProperty("input", out var input);
-                    items.Add(new("tool", Clip(InputText(input), MaxToolText), Name: Str(b, "name") ?? "tool",
+                    var name = Str(b, "name") ?? "tool";
+                    items.Add(new("tool", Clip(InputText(input), MaxToolText), Name: name,
                                   Arg: Clip(PrimaryArg(input), MaxArg), Id: Str(b, "id")));
+                    // A file Claude showed with show_file also shows in the history, after the call.
+                    if (Str(b, "type") == "tool_use" && name == ShowFileTool)
+                    {
+                        var index = shown++;
+                        if (input.ValueKind == JsonValueKind.Object && Str(input, "path") is { Length: > 0 } p
+                            && MediaKind(p) is { } media)
+                            items.Add(new("file", Name: Path.GetFileName(p.TrimEnd('\\', '/')), Id: Str(b, "id"),
+                                          Img: $"{at}:{index}", Media: media));
+                    }
                     break;
             }
         }

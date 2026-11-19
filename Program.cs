@@ -473,6 +473,25 @@ app.MapGet("/api/transcript/{sid}/image", (string sid, string? path, long at, in
     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return Results.NotFound(); }
 });
 
+// A file Claude showed with show_file, found again through the call in this
+// session's own log (so it outlives the transient /api/file id and a restart).
+// Only what the history view plays inline (Transcript.MediaKind: raster images,
+// video, audio), never sniffed.
+app.MapGet("/api/transcript/{sid}/file", (string sid, string? path, long at, int n, HttpContext ctx) =>
+{
+    if (!Transcript.IsValidPath(path) || !sessions.TryGetValue(sid, out var session)) return Results.NotFound();
+    var log = Path.GetFullPath(path!);
+    if (!session.HasServedTranscript(log)) return Results.NotFound();
+    try
+    {
+        if (Transcript.ShownFile(log, at, n) is not { } file || Transcript.MediaKind(file) == null || !File.Exists(file))
+            return Results.NotFound();
+        ctx.Response.Headers.XContentTypeOptions = "nosniff";
+        return Results.File(file, FileMeta(file).contentType, enableRangeProcessing: true);
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return Results.NotFound(); }
+});
+
 app.MapGet("/api/file/{id}", (string id) =>
 {
     if (!pendingFiles.TryGetValue(id, out var path) || !File.Exists(path))
