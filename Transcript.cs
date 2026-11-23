@@ -58,7 +58,7 @@ static class Transcript
     /// Fallback when no hook has reported the session's log: the newest log in the
     /// cwd's project folder written since launch and not claimed by another tab.
     /// Keeps <paramref name="current"/> unless a newer log was created after it
-    /// (/clear starts a new file). Can pick a Claude running outside WebTerm in
+    /// stopped being written (/clear starts a new file). Can pick a Claude running outside WebTerm in
     /// the same folder; the SessionStart hook reports the exact file.
     /// </summary>
     public static string? Guess(string cwd, DateTime launchedUtc, string? current, ISet<string> claimed)
@@ -73,7 +73,12 @@ static class Transcript
         if (current != null && File.Exists(current) && !claimed.Contains(current))
         {
             var created = File.GetCreationTimeUtc(current);
-            var newer = candidates.Where(f => f.CreationTimeUtc > created && f.CreationTimeUtc >= since)
+            // /clear stops writing the old log as it starts the new one. A log
+            // still written after the newer one appeared is still in use, and
+            // the newer one belongs to another Claude in the same folder.
+            var quietSince = File.GetLastWriteTimeUtc(current).AddSeconds(-10);
+            var newer = candidates.Where(f => f.CreationTimeUtc > created && f.CreationTimeUtc >= since
+                                              && f.CreationTimeUtc >= quietSince)
                                   .OrderByDescending(f => f.CreationTimeUtc).FirstOrDefault();
             return newer?.FullName ?? current;
         }
@@ -381,6 +386,16 @@ static class Transcript
                 case "server_tool_use":
                     b.TryGetProperty("input", out var input);
                     var name = Str(b, "name") ?? "tool";
+                    // The plan Claude asks to have approved: markdown, logged before the user answers
+                    // (the approval menu is on the terminal meanwhile). As a tool call it would be a
+                    // collapsed, clipped JSON string, so it gets its own item.
+                    if (name == "ExitPlanMode" && Str(input, "plan") is { Length: > 0 } plan)
+                    {
+                        var file = Str(input, "planFilePath");
+                        items.Add(new("plan", Clip(plan, MaxText), Name: file is null ? null : Path.GetFileName(file),
+                                      Id: Str(b, "id")));
+                        break;
+                    }
                     items.Add(new("tool", Clip(InputText(input), MaxToolText), Name: name,
                                   Arg: Clip(PrimaryArg(input), MaxArg), Id: Str(b, "id")));
                     // A file Claude showed with show_file also shows in the history, after the call.

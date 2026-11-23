@@ -133,6 +133,7 @@ window.HistoryView = (function(){
     bodyEl.replaceChildren(st.el, inputBar);
     menuSig = '';
     updateStatus();   // drop the previous tab's line before the first frame
+    updateTasks();
     updateSuggestion();
     hookMenu(tab);
     scheduleMenu();
@@ -303,8 +304,10 @@ window.HistoryView = (function(){
     send.addEventListener('click', e => { e.preventDefault(); sendMessage(); });
     // Claude's spinner line while it works (see updateStatus).
     statusEl2 = div('history-working');
+    // Background shells/agents still running (see updateTasks).
+    tasksEl = div('history-tasks');
     attachEl = div('history-attach');
-    inputBar.append(statusEl2, attachEl, msgEl, send);
+    inputBar.append(statusEl2, tasksEl, attachEl, msgEl, send);
     return inputBar;
   }
 
@@ -490,7 +493,7 @@ window.HistoryView = (function(){
   function scheduleMenu(){
     if(menuQueued) return;
     menuQueued = true;
-    requestAnimationFrame(() => { menuQueued = false; updateMenu(); updateStatus(); updateSuggestion(); });
+    requestAnimationFrame(() => { menuQueued = false; updateMenu(); updateStatus(); updateTasks(); updateSuggestion(); });
   }
 
   // When Claude's prompt is empty it may draw a suggested next prompt there as
@@ -550,7 +553,51 @@ window.HistoryView = (function(){
   // box's top rule. Only the in-progress form (with "…") counts; the
   // past-tense "✻ Worked for 5m" left after a turn doesn't.
   const SPINNER = /^\s*[·✢✳✶✻✽*]\s+(\S.{0,80}?(?:…|\.\.\.))\s*(?:\((.*?)\)?)?\s*$/;   // ")" may wrap off a narrow line
+  // After a turn that left a background agent running: "✻ Waiting for 1
+  // background agent to finish" (no "…", so SPINNER misses it).
+  const WAITING = /^\s*[·✢✳✶✻✽*]\s+(Waiting for .+? to finish)\s*$/;
   let statusEl2 = null, statusSig = '';
+  let tasksEl = null, tasksSig = '';
+
+  // Background shells and agents. Claude's footer, under the prompt box's
+  // bottom rule, counts them ("⏵⏵ auto mode on · 1 shell · ↓ to manage",
+  // "3 background tasks"), and running agents are listed below it
+  // ("( ) general-purpose  Pinging localhost   46s · ↓ 36.5k tokens").
+  // Nothing is drawn there when none are running.
+  const TASK_COUNT = /^\d+\s+(?:background\s+)?(?:tasks?|shells?|agents?|subagents?|monitors?|bash(?:es)?|jobs?)$/i;
+  // Narrow screens squeeze the description ("Pin… 26s"): one space before the time.
+  const AGENT_ROW = /^\s*(?:\S|\(.\))\s+([\w.-]+)\s{2,}(\S.*?)\s+((?:\d+[hms]\s?)+)(?:\s*·|$)/;
+
+  function parseTasks(term){
+    const buf = term.buffer.active, top = buf.baseY;
+    const text = i => { const l = buf.getLine(top + i); return l ? l.translateToString(true) : ''; };
+    let bottom = -1, rules = 0;
+    for(let i = term.rows - 1; i >= 0 && rules < 2; i--)
+      if(isPlainRule(text(i))){ if(++rules === 1) bottom = i; }
+    if(rules < 2) return null;
+    let count = '';
+    const agents = [];
+    for(let i = bottom + 1; i < term.rows; i++){
+      const s = text(i);
+      if(!count) count = s.split(/\s+·\s+|\s{3,}/).map(x => x.trim()).find(x => TASK_COUNT.test(x)) || '';
+      const a = AGENT_ROW.exec(s);
+      if(a) agents.push(`${a[1]}: ${a[2]} (${a[3].trim()})`);
+    }
+    return count || agents.length ? { count: count || agents.length + (agents.length === 1 ? ' agent' : ' agents'), agents } : null;
+  }
+
+  function updateTasks(){
+    const t = openTab && openTab.term ? parseTasks(openTab.term) : null;
+    const sig = t ? JSON.stringify(t) : '';
+    if(sig === tasksSig) return;
+    tasksSig = sig;
+    if(!tasksEl) return;
+    tasksEl.classList.toggle('show', !!t);
+    if(!t){ tasksEl.textContent = ''; return; }
+    tasksEl.textContent = '⧗ ' + t.count + ' running' + (t.agents.length ? ' · ' + t.agents.join(' · ') : '');
+    tasksEl.title = [t.count + ' running in the background', ...t.agents].join('\n') +
+      '\n(↓ in the terminal to manage them)';
+  }
 
   function parseStatus(term){
     const buf = term.buffer.active, top = buf.baseY;
@@ -558,7 +605,13 @@ window.HistoryView = (function(){
     let rules = 0, i = term.rows - 1;
     for(; i >= 0 && rules < 2; i--) if(isPlainRule(text(i))) rules++;
     if(rules < 2) return '';
+    // The waiting line stays in the scrollback once the agent is done, so it
+    // only counts right above the prompt box, with nothing printed after it.
+    let adjacent = true;
     for(let stop = Math.max(0, i - 25); i >= stop; i--){
+      const w = WAITING.exec(text(i));
+      if(w){ if(adjacent) return w[1]; continue; }
+      if(text(i).trim()) adjacent = false;
       const m = SPINNER.exec(text(i));
       if(!m) continue;
       // Esc here closes the overlay, so its hint is noise.
@@ -985,6 +1038,18 @@ window.HistoryView = (function(){
         st.el.appendChild(d);
         break;
       }
+      // ExitPlanMode's plan: a Claude bubble with the plan as markdown. Its
+      // result (approved, or the user's feedback) attaches like a tool's.
+      case 'plan': {
+        const el = div('h-assistant h-plan');
+        const head = div('h-plan-head', 'Plan' + (it.name ? ' · ' + it.name : ''));
+        const body = document.createElement('div');
+        body.innerHTML = markdown(it.text || '');
+        el.append(head, body);
+        st.el.appendChild(el);
+        if(it.id) st.tools[it.id] = el;
+        break;
+      }
       case 'tool': {
         const d = document.createElement('details');
         d.className = 'h-tool';
@@ -1000,8 +1065,20 @@ window.HistoryView = (function(){
         break;
       }
       case 'result': {
-        const res = pre('h-result' + (it.err ? ' err' : ''), it.text || '(no output)');
         const owner = it.id && st.tools[it.id];
+        let res = pre('h-result' + (it.err ? ' err' : ''), it.text || '(no output)');
+        // An approval repeats the whole plan ("## Approved Plan:"), so a status
+        // line is enough; a rejection shows just what the user said.
+        if(owner && owner.classList.contains('h-plan')){
+          const text = it.text || '';
+          // Success is the result's error flag; the wording only picks what to show.
+          const ok = !it.err;
+          const said = /the user said:\s*([\s\S]+)/i.exec(text);
+          const summary = (said ? said[1] : text.split(/\n## Approved Plan:/)[0]).trim();
+          res = div('h-plan-status' + (ok ? ' ok' : ' err'),
+            ok ? (/^User has approved/.test(text) || !summary ? '✓ Approved' : '✓ ' + summary)
+               : '✗ ' + summary);
+        }
         if(owner){
           owner.appendChild(res);
           if(it.err) owner.classList.add('err');

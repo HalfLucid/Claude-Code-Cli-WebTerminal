@@ -142,6 +142,12 @@ body.has-tabs #history-overlay{top:37px;height:calc(100dvh - 37px)}
 .h-user{align-self:flex-end;max-width:85%;white-space:pre-wrap;background:#1f3a5f;color:#e6edf3;border-radius:16px 16px 4px 16px;padding:8px 12px;margin-top:6px}
 .history-list>.h-assistant{align-self:flex-start;max-width:95%;background:#161b22;border:1px solid #21262d;border-radius:16px 16px 16px 4px;padding:10px 14px}
 .history-list>.h-assistant>:last-child{margin-bottom:0}
+/* ExitPlanMode's plan, with its approval status underneath once answered. */
+.history-list>.h-plan{border-color:#1f6feb;max-width:100%}
+.h-plan-head{font:600 12px monospace;color:#58a6ff;margin-bottom:6px;text-transform:uppercase;letter-spacing:.04em}
+.h-plan-status{margin-top:8px;padding-top:6px;border-top:1px solid #30363d;font-size:13px;white-space:pre-wrap}
+.h-plan-status.ok{color:#3fb950}
+.h-plan-status.err{color:#f0883e}
 /* Claude's interactive menu (approval, --resume picker, /model), mirrored from the terminal screen. */
 .h-menu{border:1px solid #d29922;border-radius:10px;background:#161b22;padding:10px;margin:6px 0 12px;font:13px/1.45 monospace}
 .h-menu.busy{opacity:.55;pointer-events:none}
@@ -195,6 +201,8 @@ body.has-tabs #history-overlay{top:37px;height:calc(100dvh - 37px)}
 .history-input.pinned{position:sticky;bottom:-24px;z-index:1}
 .history-working{display:none;flex:0 0 100%;font:13px monospace;color:#d29922;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .history-working.show{display:block}
+.history-tasks{display:none;flex:0 0 100%;font:13px monospace;color:#58a6ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.history-tasks.show{display:block}
 .history-attach{display:none;flex:0 0 100%;flex-wrap:wrap;gap:6px}
 .history-attach.show{display:flex}
 .h-attach{display:inline-flex;align-items:center;gap:4px;max-width:100%;padding:3px 4px 3px 10px;border-radius:12px;background:#21262d;border:1px solid #30363d;color:#c9d1d9;font:13px system-ui,sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

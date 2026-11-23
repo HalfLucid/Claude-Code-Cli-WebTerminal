@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.WebSockets;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -11,23 +12,43 @@ using System.Text.Json.Serialization;
 using System.Threading.Channels;
 using Porta.Pty;
 
+// Must run before anything touches Console: .NET binds the console streams on first use.
+ConsoleHost.AttachToParent();
+
+var logPath = Path.Combine(AppContext.BaseDirectory, "webterm.log");
+var logLock = new object();
+var logLines = 0;
+RotateLog();
+
 var settingsPath = Path.Combine(AppContext.BaseDirectory, "webterm-settings.json");
 var sm = new SettingsManager(settingsPath);
 var settings = sm.Load();
 
 if (settings.Credentials is null)
 {
+    // Started without a visible console (Startup shortcut, Explorer, the hidden restart
+    // PowerShell): open one for the prompt.
+    ConsoleHost.EnsureConsole();
     Console.WriteLine("=== WebTerm First-Run Setup ===");
     Console.WriteLine("No credentials found. Please set up your login.");
-    Console.Write("Username: ");
-    var username = Console.ReadLine()?.Trim();
-    if (string.IsNullOrEmpty(username)) { Console.WriteLine("Username cannot be empty."); return; }
-    Console.Write("Password: ");
-    var password = ReadPassword();
-    if (string.IsNullOrEmpty(password)) { Console.WriteLine("Password cannot be empty."); return; }
-    Console.Write("Confirm password: ");
-    var confirm = ReadPassword();
-    if (password != confirm) { Console.WriteLine("Passwords do not match."); return; }
+    // Re-ask on invalid input rather than exiting: a console we opened ourselves
+    // would close with the process before the error could be read.
+    string username, password;
+    while (true)
+    {
+        Console.Write("Username: ");
+        var line = Console.ReadLine();
+        if (line is null) return; // stdin closed: nobody to ask
+        username = line.Trim();
+        if (string.IsNullOrEmpty(username)) { Console.WriteLine("Username cannot be empty."); continue; }
+        Console.Write("Password: ");
+        password = ReadPassword();
+        if (string.IsNullOrEmpty(password)) { Console.WriteLine("Password cannot be empty."); continue; }
+        Console.Write("Confirm password: ");
+        var confirm = ReadPassword();
+        if (password != confirm) { Console.WriteLine("Passwords do not match."); continue; }
+        break;
+    }
     settings.Credentials = new CredentialSettings
     {
         UsernameProtected = SettingsManager.Protect(username),
@@ -67,7 +88,29 @@ string GetClientIp(HttpContext ctx)
     return ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
 }
 
-void Log(string message) => Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+// Logs go to the console when there is one and always to webterm.log beside the exe,
+// since a windowless instance has nowhere else to show them.
+void Log(string message)
+{
+    var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}";
+    Console.WriteLine(line);
+    lock (logLock)
+    {
+        if (++logLines % 1000 == 0) RotateLog();
+        try { File.AppendAllText(logPath, line + Environment.NewLine); } catch { }
+    }
+}
+
+// Keeps the log under 5 MB, with one previous generation in webterm.log.old.
+void RotateLog()
+{
+    try
+    {
+        if (File.Exists(logPath) && new FileInfo(logPath).Length > 5 * 1024 * 1024)
+            File.Move(logPath, logPath + ".old", overwrite: true);
+    }
+    catch { }
+}
 
 app.Use(async (ctx, next) =>
 {
@@ -369,39 +412,45 @@ app.MapPost("/api/startup", async (HttpContext ctx) =>
     return Results.Json(new { enabled = File.Exists(shortcutPath) });
 });
 
-app.MapPost("/api/restart", () =>
+// Rebuilds and relaunches WebTerm from its project folder once this process has exited, then exits.
+// The replacement runs hidden (no window), so a failed build opens its output in Notepad instead of
+// vanishing. Returns an error message, or null once the restart is under way.
+string? SpawnRestart(string via)
 {
-    var baseDir = AppContext.BaseDirectory;
     string? projectDir = null;
-    var dir = new DirectoryInfo(baseDir);
+    var dir = new DirectoryInfo(AppContext.BaseDirectory);
     while (dir != null)
     {
         if (dir.GetFiles("*.csproj").Length > 0) { projectDir = dir.FullName; break; }
         dir = dir.Parent;
     }
-    if (projectDir == null)
-        return Results.Problem("Cannot find project directory");
+    if (projectDir == null) return "Cannot find project directory";
 
     var pid = Environment.ProcessId;
     var escaped = projectDir.Replace("'", "''");
-    var script = $"while(Get-Process -Id {pid} -EA SilentlyContinue){{Start-Sleep -Milliseconds 500}}; Set-Location '{escaped}'; dotnet build; if($LASTEXITCODE -eq 0){{ dotnet run }}";
+    var buildLog = Path.Combine(Path.GetTempPath(), "webterm-restart-build.log").Replace("'", "''");
+    var script = $"while(Get-Process -Id {pid} -EA SilentlyContinue){{Start-Sleep -Milliseconds 500}}; " +
+                 $"Set-Location '{escaped}'; $o = dotnet build 2>&1; " +
+                 $"if($LASTEXITCODE -eq 0){{ $env:WEBTERM_HIDDEN_CONSOLE='1'; dotnet run }} else {{ $o | Set-Content '{buildLog}'; Start-Process notepad '{buildLog}' }}";
     Process.Start(new ProcessStartInfo
     {
         FileName = "powershell.exe",
         Arguments = $"-NoProfile -Command \"{script}\"",
         UseShellExecute = true,
-        WindowStyle = ProcessWindowStyle.Minimized
+        WindowStyle = ProcessWindowStyle.Hidden
     });
 
-    Log("RESTART requested — spawned replacement, exiting");
+    Log($"RESTART requested{via} — spawned replacement, exiting");
     _ = Task.Run(async () =>
     {
         await Task.Delay(500);
         Environment.Exit(0);
     });
+    return null;
+}
 
-    return Results.Ok(new { restarting = true });
-});
+app.MapPost("/api/restart", () =>
+    SpawnRestart("") is { } error ? Results.Problem(error) : Results.Ok(new { restarting = true }));
 
 app.MapGet("/api/sessions", () =>
 {
@@ -667,28 +716,16 @@ static bool IsNestedClaude(JsonElement body, int? ptyPid)
     return false;
 }
 
-app.MapPost("/api/mcp-setup", () =>
+// Writes the notify hook script and registers any missing webterm hooks in
+// Claude's settings. Run by setup, and at startup once setup has been done, so
+// a WebTerm update's new script or hooks reach Claude without re-running setup.
+// Files are only rewritten when they change.
+void InstallClaudeHooks()
 {
-    var current = sm.Load();
-    string mcpKey;
-    if (!string.IsNullOrEmpty(current.McpKeyProtected))
-    {
-        mcpKey = SettingsManager.Unprotect(current.McpKeyProtected);
-    }
-    else
-    {
-        var keyBytes = RandomNumberGenerator.GetBytes(32);
-        mcpKey = Convert.ToBase64String(keyBytes).Replace("+", "-").Replace("/", "_").TrimEnd('=');
-        current.McpKeyProtected = SettingsManager.Protect(mcpKey);
-        sm.Save(current);
-        Log("MCP key generated and saved");
-    }
-
     var claudeDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
     var hooksDirPath = Path.Combine(claudeDir, "hooks");
-    Directory.CreateDirectory(hooksDirPath);
     var hookScriptPath = Path.Combine(hooksDirPath, "webterm-notify.ps1");
-    File.WriteAllText(hookScriptPath, $$"""
+    var hookScript = $$"""
         $sid = $env:WEBTERM_SID
         $token = $env:WEBTERM_NOTIFY_TOKEN
         if (-not $sid -or -not $token) { exit 0 }
@@ -716,7 +753,20 @@ app.MapPost("/api/mcp-setup", () =>
             # Loopback-only HTTP port: token never hits the wire, so no TLS / cert handling needed (works on Windows PowerShell 5.1).
             Invoke-RestMethod -Uri "http://127.0.0.1:{{LoopbackHttpPort}}/api/notify" -Method POST -Headers @{ Authorization = "Bearer $token" } -Body $body -ContentType 'application/json; charset=utf-8' -TimeoutSec 2 2>$null | Out-Null
         } catch {}
-        """);
+        """;
+    try
+    {
+        if (!File.Exists(hookScriptPath) || File.ReadAllText(hookScriptPath) != hookScript)
+        {
+            Directory.CreateDirectory(hooksDirPath);
+            File.WriteAllText(hookScriptPath, hookScript);
+            Log("Claude notify hook script updated");
+        }
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        Log($"Failed to write Claude notify hook script: {ex.Message}");
+    }
 
     try
     {
@@ -735,6 +785,7 @@ app.MapPost("/api/mcp-setup", () =>
         }
 
         var hookCmd = $"powershell.exe -ExecutionPolicy Bypass -File \"{hookScriptPath}\"";
+        var changed = false;
 
         void AddHookIfMissing(string eventName, string arg, string? matcher = "*")
         {
@@ -770,6 +821,7 @@ app.MapPost("/api/mcp-setup", () =>
             };
             if (matcher != null) entry["matcher"] = matcher;
             arr.Add(entry);
+            changed = true;
         }
 
         AddHookIfMissing("PermissionRequest", "permission_request");
@@ -779,13 +831,38 @@ app.MapPost("/api/mcp-setup", () =>
         // so it adds nothing to Claude's context.
         AddHookIfMissing("SessionStart", "session_start", null);
 
-        File.WriteAllText(claudeSettingsPath, claudeSettings.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-        Log("Claude hooks configured for WebTerm notifications");
+        if (changed)
+        {
+            File.WriteAllText(claudeSettingsPath, claudeSettings.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            Log("Claude hooks configured for WebTerm notifications");
+        }
     }
     catch (Exception ex)
     {
         Log($"Failed to configure Claude hooks: {ex.Message}");
     }
+}
+
+if (!string.IsNullOrEmpty(settings.McpKeyProtected)) InstallClaudeHooks();
+
+app.MapPost("/api/mcp-setup", () =>
+{
+    var current = sm.Load();
+    string mcpKey;
+    if (!string.IsNullOrEmpty(current.McpKeyProtected))
+    {
+        mcpKey = SettingsManager.Unprotect(current.McpKeyProtected);
+    }
+    else
+    {
+        var keyBytes = RandomNumberGenerator.GetBytes(32);
+        mcpKey = Convert.ToBase64String(keyBytes).Replace("+", "-").Replace("/", "_").TrimEnd('=');
+        current.McpKeyProtected = SettingsManager.Protect(mcpKey);
+        sm.Save(current);
+        Log("MCP key generated and saved");
+    }
+
+    InstallClaudeHooks();
 
     // Loopback HTTP + Bearer header: token stays off the wire and out of the URL (so it doesn't land in logs/history).
     var url = $"http://127.0.0.1:{LoopbackHttpPort}/mcp";
@@ -1111,34 +1188,8 @@ object McpListTabs(JsonElement? id)
 
 object McpRestart(JsonElement? id)
 {
-    var baseDir = AppContext.BaseDirectory;
-    string? projectDir = null;
-    var dir = new DirectoryInfo(baseDir);
-    while (dir != null)
-    {
-        if (dir.GetFiles("*.csproj").Length > 0) { projectDir = dir.FullName; break; }
-        dir = dir.Parent;
-    }
-    if (projectDir == null)
-        return McpError(id, -32603, "Cannot find project directory");
-
-    var pid = Environment.ProcessId;
-    var escaped = projectDir.Replace("'", "''");
-    var script = $"while(Get-Process -Id {pid} -EA SilentlyContinue){{Start-Sleep -Milliseconds 500}}; Set-Location '{escaped}'; dotnet build; if($LASTEXITCODE -eq 0){{ dotnet run }}";
-    Process.Start(new ProcessStartInfo
-    {
-        FileName = "powershell.exe",
-        Arguments = $"-NoProfile -Command \"{script}\"",
-        UseShellExecute = true,
-        WindowStyle = ProcessWindowStyle.Minimized
-    });
-
-    Log("RESTART requested via MCP — spawned replacement, exiting");
-    _ = Task.Run(async () =>
-    {
-        await Task.Delay(500);
-        Environment.Exit(0);
-    });
+    if (SpawnRestart(" via MCP") is { } error)
+        return McpError(id, -32603, error);
 
     return McpResult(id, new
     {
@@ -1174,6 +1225,20 @@ app.Map("/ws", async ctx =>
 
 app.Lifetime.ApplicationStarted.Register(() =>
 {
+    Tray.Start(
+        url: $"https://localhost:{HttpsPort}",
+        logPath: logPath,
+        sessionCount: () => sessions.Count(kv => kv.Value.IsLaunched && !kv.Value.PtyExited),
+        restart: () => { if (SpawnRestart(" from tray") is { } error) Log($"RESTART failed: {error}"); },
+        // Not StopApplication: it waits (~30 s) for the open SSE and WebSocket requests,
+        // leaving the icon up and the process alive as if Exit did nothing.
+        exit: () =>
+        {
+            Log("EXIT requested from tray");
+            Tray.Remove();
+            foreach (var s in sessions.Values) { try { s.Dispose(); } catch { } }
+            Environment.Exit(0);
+        });
     try
     {
         Process.Start(new ProcessStartInfo
@@ -1255,6 +1320,42 @@ static string ReadPassword()
         }
     }
     return sb.ToString();
+}
+
+// webterm is a GUI-subsystem exe (no console window of its own). When launched from a
+// console (dotnet run, a terminal) it borrows the parent's so logs and the first-run
+// prompt still appear there.
+static class ConsoleHost
+{
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(int processId);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AllocConsole();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
+    const int AttachParentProcess = -1;
+    // Set by SpawnRestart's hidden PowerShell: the console borrowed from it can't be seen.
+    const string HiddenConsoleVar = "WEBTERM_HIDDEN_CONSOLE";
+
+    public static bool HasConsole { get; private set; }
+    static bool _hidden;
+
+    public static void AttachToParent()
+    {
+        HasConsole = AttachConsole(AttachParentProcess);
+        _hidden = Environment.GetEnvironmentVariable(HiddenConsoleVar) == "1";
+        // Don't pass it on to the shells WebTerm spawns.
+        Environment.SetEnvironmentVariable(HiddenConsoleVar, null);
+    }
+
+    // Makes sure there is a console the user can see. A prompt in the hidden restart
+    // console would wait forever, so swap it for a new one. (Not GetConsoleWindow +
+    // IsWindowVisible: under Windows Terminal that is ConPTY's hidden pseudo-window.)
+    // Call before anything touches Console.
+    public static void EnsureConsole()
+    {
+        if (HasConsole && !_hidden) return;
+        if (HasConsole) FreeConsole();
+        HasConsole = AllocConsole();
+        _hidden = false;
+    }
 }
 
 sealed class Session : IDisposable

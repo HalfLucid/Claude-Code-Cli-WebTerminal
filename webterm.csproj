@@ -1,10 +1,24 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- WinForms only for the notification-area icon (Tray.cs). -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- Keep the pre-WinForms output folder: webterm-settings.json and the Startup shortcut point there. -->
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin\$(Configuration)\net10.0\</OutputPath>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- GUI subsystem: no console window of its own when started from the Startup shortcut or a restart.
+         ConsoleHost attaches to the parent's console (dotnet run, a terminal) so logs still show there. -->
+    <OutputType>WinExe</OutputType>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Don't make WinForms/Drawing global: their Timer, Color, Label etc. would clash in Program.cs. -->
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Porta.Pty" Version="1.0.7" />
