@@ -56,6 +56,12 @@ if (settings.Credentials is null)
     };
     sm.Save(settings);
     Console.WriteLine("Credentials saved (encrypted with DPAPI).");
+    if (ConsoleHost.Owned)
+    {
+        Console.WriteLine("WebTerm is starting; it runs from the tray icon. This window will close.");
+        Thread.Sleep(2000);
+    }
+    ConsoleHost.ReleaseOwned();
 }
 
 var (authUser, authPass) = sm.DecryptCredentials(settings.Credentials);
@@ -1334,8 +1340,19 @@ static class ConsoleHost
     // Set by SpawnRestart's hidden PowerShell: the console borrowed from it can't be seen.
     const string HiddenConsoleVar = "WEBTERM_HIDDEN_CONSOLE";
 
+    [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr process, int infoClass, ref ProcessBasicInformation info, int size, out int returnLength);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct ProcessBasicInformation
+    {
+        public IntPtr ExitStatus, PebBaseAddress, AffinityMask, BasePriority, UniqueProcessId, InheritedFromUniqueProcessId;
+    }
+
     public static bool HasConsole { get; private set; }
     static bool _hidden;
+    // True when the console was opened by EnsureConsole (not borrowed from a parent).
+    static bool _owned;
+    public static bool Owned => _owned;
 
     public static void AttachToParent()
     {
@@ -1345,16 +1362,45 @@ static class ConsoleHost
         Environment.SetEnvironmentVariable(HiddenConsoleVar, null);
     }
 
-    // Makes sure there is a console the user can see. A prompt in the hidden restart
-    // console would wait forever, so swap it for a new one. (Not GetConsoleWindow +
-    // IsWindowVisible: under Windows Terminal that is ConPTY's hidden pseudo-window.)
-    // Call before anything touches Console.
+    // Makes sure there is a console the user can type into. A borrowed console is only
+    // kept when the parent waits for us (dotnet run): a shell that started this GUI exe
+    // directly has already returned to its own prompt and would read the same keys.
+    // A prompt in the hidden restart console would wait forever, so that is swapped
+    // too. (Not GetConsoleWindow + IsWindowVisible: under Windows Terminal that is
+    // ConPTY's hidden pseudo-window.) Call before anything touches Console.
     public static void EnsureConsole()
     {
-        if (HasConsole && !_hidden) return;
+        if (HasConsole && !_hidden && ParentIsDotnet()) return;
         if (HasConsole) FreeConsole();
         HasConsole = AllocConsole();
+        _owned = HasConsole;
         _hidden = false;
+    }
+
+    // Closes a console EnsureConsole opened, so closing that window (or Ctrl+C in it)
+    // can't kill the server. Console output is pointed at nothing first: the cached
+    // writers would otherwise throw on the freed handle at the next Log.
+    public static void ReleaseOwned()
+    {
+        if (!_owned) return;
+        Console.SetOut(TextWriter.Null);
+        Console.SetError(TextWriter.Null);
+        FreeConsole();
+        _owned = false;
+        HasConsole = false;
+    }
+
+    static bool ParentIsDotnet()
+    {
+        try
+        {
+            var info = new ProcessBasicInformation();
+            if (NtQueryInformationProcess(Process.GetCurrentProcess().Handle, 0, ref info, Marshal.SizeOf(info), out _) != 0)
+                return false;
+            using var parent = Process.GetProcessById((int)info.InheritedFromUniqueProcessId);
+            return string.Equals(parent.ProcessName, "dotnet", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
     }
 }
 
