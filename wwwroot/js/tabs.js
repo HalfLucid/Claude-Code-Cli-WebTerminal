@@ -31,6 +31,7 @@ window.TabManager = (function(){
     };
 
     tabs.push(tab);
+    HistoryView.watch(tab);
     switchTo(tabs.length - 1);
     Connection.connect(tab);
     saveTabs();
@@ -58,6 +59,7 @@ window.TabManager = (function(){
     };
 
     tabs.push(tab);
+    HistoryView.watch(tab);
     Connection.connect(tab);
     return tab;
   }
@@ -251,6 +253,7 @@ window.TabManager = (function(){
     };
 
     tabs.push(tab);
+    HistoryView.watch(tab);
     Connection.connect(tab);
     saveTabs();
     return tab;

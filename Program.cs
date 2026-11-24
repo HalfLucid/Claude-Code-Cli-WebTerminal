@@ -334,7 +334,7 @@ app.MapGet("/api/settings", () =>
 app.MapPost("/api/projects", async (HttpContext ctx) =>
 {
     var proj = await ctx.Request.ReadFromJsonAsync<ProjectSettings>();
-    if (proj is null || string.IsNullOrWhiteSpace(proj.Name)) return Results.BadRequest();
+    if (proj is null || string.IsNullOrWhiteSpace(proj.Name) || Agents.Get(proj.Agent) == null) return Results.BadRequest();
     proj.Id = Guid.NewGuid().ToString();
     var current = sm.Load();
     current.Projects.Add(proj);
@@ -345,13 +345,14 @@ app.MapPost("/api/projects", async (HttpContext ctx) =>
 app.MapPut("/api/projects/{id}", async (string id, HttpContext ctx) =>
 {
     var update = await ctx.Request.ReadFromJsonAsync<ProjectSettings>();
-    if (update is null) return Results.BadRequest();
+    if (update is null || Agents.Get(update.Agent) == null) return Results.BadRequest();
     var current = sm.Load();
     var existing = current.Projects.FirstOrDefault(p => p.Id == id);
     if (existing is null) return Results.NotFound();
     existing.Name = update.Name;
     existing.Directory = update.Directory;
     existing.Color = update.Color;
+    existing.Agent = update.Agent;
     sm.Save(current);
     return Results.Json(existing);
 });
@@ -484,7 +485,7 @@ app.MapDelete("/api/sessions/{sid}", (string sid) =>
     return Results.Ok(new { closed = sid });
 });
 
-// Claude's own conversation log for a tab, distilled to display entries, so the
+// The agent's own conversation log for a tab, distilled to display entries, so the
 // browser can show history that reflows to any width (the PTY replay is laid
 // out for the width it was produced at). Incremental: `from` is the byte offset
 // a previous call returned for `path`; a different path (or none) reads from 0.
@@ -668,12 +669,12 @@ app.MapPost("/api/notify", async (HttpContext ctx) =>
         return;
     }
 
-    // A Claude started inside the tab (e.g. `claude -p` from its Bash tool)
+    // An agent started inside the tab (e.g. `claude -p` from Claude's Bash tool)
     // inherits WEBTERM_SID, so its hooks would repoint the tab's history at its
     // own log and fire idle/attention for the tab. Drop those.
-    if (sessions.TryGetValue(sid, out var nsess) && IsNestedClaude(body, nsess.Pty?.Pid))
+    if (sessions.TryGetValue(sid, out var nsess) && IsNestedAgent(body, nsess.Pty?.Pid))
     {
-        Log($"NOTIFY sid={sid[..Math.Min(8, sid.Length)]}… event={evt} ignored (nested Claude)");
+        Log($"NOTIFY sid={sid[..Math.Min(8, sid.Length)]}… event={evt} ignored (nested agent)");
         return;
     }
 
@@ -681,7 +682,7 @@ app.MapPost("/api/notify", async (HttpContext ctx) =>
     // /api/transcript serves the exact file instead of guessing.
     var transcript = body.TryGetProperty("transcript", out var tp) && tp.ValueKind == JsonValueKind.String ? tp.GetString() : null;
     if (Transcript.IsValidPath(transcript) && sessions.TryGetValue(sid, out var tsess))
-        tsess.SetTranscript(Path.GetFullPath(transcript!));
+        tsess.SetTranscript(Transcript.Preferred(Path.GetFullPath(transcript!)));
     if (evt == "session_start")
     {
         Log($"NOTIFY sid={sid[..Math.Min(8, sid.Length)]}… event={evt}");
@@ -701,47 +702,57 @@ app.MapPost("/api/notify", async (HttpContext ctx) =>
 });
 
 // The hook sends its process ancestry (`chain`: [{pid, name}], nearest first).
-// The tab's own Claude is the only claude.exe/node.exe between the hook and
-// the PTY's process (which may itself be claude.exe/node.exe when spawned
-// directly); a second one means a Claude launched from inside the tab. No
+// The tab's own agent is the only agent process (claude.exe/node.exe/agy.exe)
+// between the hook and the PTY's process (which may itself be the agent when
+// spawned directly); a second one means an agent launched from inside the tab
+// (of either kind: a Claude in an agy tab would repoint its history too). No
 // chain (older hook script) or the PTY not found in it: not nested.
-static bool IsNestedClaude(JsonElement body, int? ptyPid)
+static bool IsNestedAgent(JsonElement body, int? ptyPid)
 {
     if (ptyPid is not int root || !body.TryGetProperty("chain", out var chain) || chain.ValueKind != JsonValueKind.Array)
         return false;
-    var claudes = 0;
+    var agents = 0;
     foreach (var p in chain.EnumerateArray())
     {
         if (p.ValueKind != JsonValueKind.Object) return false;
         var name = p.TryGetProperty("name", out var n) && n.ValueKind == JsonValueKind.String ? n.GetString() : null;
-        if (string.Equals(name, "claude.exe", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(name, "node.exe", StringComparison.OrdinalIgnoreCase)) claudes++;
+        if (Agents.All.Any(a => a.ProcessNames.Contains(name, StringComparer.OrdinalIgnoreCase))) agents++;
         if (p.TryGetProperty("pid", out var pid) && pid.ValueKind == JsonValueKind.Number
-            && pid.TryGetInt32(out var v) && v == root) return claudes > 1;
+            && pid.TryGetInt32(out var v) && v == root) return agents > 1;
     }
     return false;
 }
 
-// Writes the notify hook script and registers any missing webterm hooks in
-// Claude's settings. Run by setup, and at startup once setup has been done, so
-// a WebTerm update's new script or hooks reach Claude without re-running setup.
-// Files are only rewritten when they change.
-void InstallClaudeHooks()
+// Writes the notify hook script and registers any missing webterm hooks with
+// each agent (Claude's settings.json, agy's global hooks.json). Run by setup,
+// and at startup once setup has been done, so a WebTerm update's new script or
+// hooks reach the agents without re-running setup. Files are only rewritten
+// when they change.
+void InstallAgentHooks()
 {
     var claudeDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
     var hooksDirPath = Path.Combine(claudeDir, "hooks");
     var hookScriptPath = Path.Combine(hooksDirPath, "webterm-notify.ps1");
+    // Args: <event> [agent]. Claude's registrations pass no agent.
     var hookScript = $$"""
+        $agent = $args[1]
+        # agy reads a JSON object from every hook's stdout. Claude gets nothing, so its SessionStart adds nothing to its context.
+        if ($agent) { '{}' }
         $sid = $env:WEBTERM_SID
         $token = $env:WEBTERM_NOTIFY_TOKEN
         if (-not $sid -or -not $token) { exit 0 }
         $eventType = $args[0]
         if (-not $eventType) { exit 0 }
-        # Claude passes the hook's JSON on stdin; its transcript_path lets WebTerm show this conversation's history.
+        # The agent passes the hook's JSON on stdin; its transcript path lets WebTerm show this conversation's history
+        # (transcript_path from Claude, transcriptPath from agy).
         $transcript = $null
+        $hook = $null
         try { [Console]::InputEncoding = [Text.Encoding]::UTF8 } catch {}
-        try { $transcript = ([Console]::In.ReadToEnd() | ConvertFrom-Json).transcript_path } catch {}
-        # Process ancestry, nearest first: lets WebTerm ignore a Claude started inside the tab (it inherits WEBTERM_SID).
+        try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch {}
+        if ($hook) { $transcript = if ($hook.transcript_path) { $hook.transcript_path } else { $hook.transcriptPath } }
+        # agy's Stop also fires when a turn ends with background tasks still running; not finished yet.
+        if ($eventType -eq 'stop' -and $hook -and $hook.fullyIdle -eq $false) { exit 0 }
+        # Process ancestry, nearest first: lets WebTerm ignore an agent started inside the tab (it inherits WEBTERM_SID).
         $chain = @()
         try {
             $procs = @{}
@@ -766,12 +777,12 @@ void InstallClaudeHooks()
         {
             Directory.CreateDirectory(hooksDirPath);
             File.WriteAllText(hookScriptPath, hookScript);
-            Log("Claude notify hook script updated");
+            Log("Agent notify hook script updated");
         }
     }
     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
     {
-        Log($"Failed to write Claude notify hook script: {ex.Message}");
+        Log($"Failed to write agent notify hook script: {ex.Message}");
     }
 
     try
@@ -847,9 +858,41 @@ void InstallClaudeHooks()
     {
         Log($"Failed to configure Claude hooks: {ex.Message}");
     }
+
+    // agy: a named entry in its global hooks.json (~/.gemini/config, which agy
+    // creates), replaced whenever it differs. SessionStart/Stop take a flat list
+    // of handlers; agy runs them via cmd /c.
+    var agyConfig = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".gemini", "config");
+    if (!Directory.Exists(agyConfig)) return;
+    try
+    {
+        var agyHooksPath = Path.Combine(agyConfig, "hooks.json");
+        var text = File.Exists(agyHooksPath) ? File.ReadAllText(agyHooksPath) : "";
+        var agyHooks = string.IsNullOrWhiteSpace(text) ? new JsonObject() : JsonNode.Parse(text)?.AsObject() ?? new JsonObject();
+        JsonArray Handler(string evt) => new()
+        {
+            new JsonObject
+            {
+                ["type"] = "command",
+                ["command"] = $"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{hookScriptPath}\" {evt} agy",
+                ["timeout"] = 10
+            }
+        };
+        var entry = new JsonObject { ["SessionStart"] = Handler("session_start"), ["Stop"] = Handler("stop") };
+        if (agyHooks["webterm-notify"]?.ToJsonString() != entry.ToJsonString())
+        {
+            agyHooks["webterm-notify"] = entry;
+            File.WriteAllText(agyHooksPath, agyHooks.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+            Log("agy hooks configured for WebTerm notifications");
+        }
+    }
+    catch (Exception ex)
+    {
+        Log($"Failed to configure agy hooks: {ex.Message}");
+    }
 }
 
-if (!string.IsNullOrEmpty(settings.McpKeyProtected)) InstallClaudeHooks();
+if (!string.IsNullOrEmpty(settings.McpKeyProtected)) InstallAgentHooks();
 
 app.MapPost("/api/mcp-setup", () =>
 {
@@ -868,14 +911,22 @@ app.MapPost("/api/mcp-setup", () =>
         Log("MCP key generated and saved");
     }
 
-    InstallClaudeHooks();
+    InstallAgentHooks();
 
     // Loopback HTTP + Bearer header: token stays off the wire and out of the URL (so it doesn't land in logs/history).
     var url = $"http://127.0.0.1:{LoopbackHttpPort}/mcp";
-    // Remove any existing registration first so re-running setup updates the token/url cleanly. `;` continues even if remove fails (not registered).
-    // Single-quote the sid header so PowerShell passes ${WEBTERM_SID} literally to claude, which expands it per-session at config load.
-    // ${WEBTERM_SID:-} keeps config parseable when the var is unset (claude run outside a webterm tab) — server then falls back to default cwd.
-    var command = $"claude mcp remove webterm -s user 2>$null; claude mcp add webterm --transport http \"{url}\" --header \"Authorization: Bearer {mcpKey}\" --header 'X-Webterm-Sid: ${{WEBTERM_SID:-}}' -s user";
+    // Registers with each agent CLI on PATH. Remove any existing registration first so re-running setup updates the token/url
+    // cleanly. `;` continues even if remove fails (not registered).
+    // Single-quote the sid header so PowerShell passes ${WEBTERM_SID} literally to the agent, which expands it per-session at config load
+    // (Claude does; if agy doesn't, the header is just a literal and open_tab needs an explicit projectId).
+    // ${WEBTERM_SID:-} keeps config parseable when the var is unset (agent run outside a webterm tab) — server then falls back to default cwd.
+    var parts = new List<string>();
+    if (Agents.Claude.IsOnPath())
+        parts.Add($"claude mcp remove webterm -s user 2>$null; claude mcp add webterm --transport http \"{url}\" --header \"Authorization: Bearer {mcpKey}\" --header 'X-Webterm-Sid: ${{WEBTERM_SID:-}}' -s user; 'Registered with Claude Code'");
+    if (Agents.Agy.IsOnPath())
+        parts.Add($"agy mcp remove webterm 2>$null; agy mcp add --header \"Authorization: Bearer {mcpKey}\" --header 'X-Webterm-Sid: ${{WEBTERM_SID}}' webterm \"{url}\"; 'Registered with agy'");
+    if (parts.Count == 0) parts.Add("'Neither claude nor agy was found on PATH'");
+    var command = string.Join("; ", parts);
     return Results.Json(new { command, url });
 });
 
@@ -938,10 +989,10 @@ app.MapPost("/mcp", async (HttpContext ctx) =>
                         type = "object",
                         properties = new Dictionary<string, object>
                         {
-                            ["kind"] = new { type = "string", description = "Session type", @enum = new[] { "powershell", "claude", "claude-resume" } },
-                            ["projectId"] = new { type = "string", description = "Project ID (required for claude/claude-resume)" },
+                            ["kind"] = new { type = "string", description = "Session type: powershell, an agent CLI (claude = Claude Code, agy = Antigravity CLI), or <agent>-resume to continue that agent's last conversation in the project folder", @enum = Agents.Kinds },
+                            ["projectId"] = new { type = "string", description = "Project ID (from list_tabs). Defaults to the calling tab's project when the caller's agent sends its tab id; otherwise required for agent kinds, which run in the project's folder" },
                             ["label"] = new { type = "string", description = "Tab label shown in browser" },
-                            ["command"] = new { type = "string", description = "kind=claude: the initial prompt, passed verbatim to Claude at launch and submitted immediately (multi-line and any characters are fine; max ~30000 chars). kind=powershell: a PowerShell command run at startup before the prompt appears (max ~12000 chars, since it is passed base64-encoded as UTF-16). Not supported for claude-resume." }
+                            ["command"] = new { type = "string", description = "kind=claude or agy: the initial prompt, passed verbatim to the agent at launch and submitted immediately (multi-line and any characters are fine; max ~30000 chars). kind=powershell: a PowerShell command run at startup before the prompt appears (max ~12000 chars, since it is passed base64-encoded as UTF-16). Not supported for *-resume kinds." }
                         },
                         required = new[] { "kind" }
                     }),
@@ -1037,11 +1088,18 @@ object McpOpenTab(JsonElement? id, JsonElement args, string? callerSid)
     var label = args.TryGetProperty("label", out var l) ? l.GetString() : kind;
     var command = args.TryGetProperty("command", out var c) ? c.GetString() : null;
 
+    var agentKind = Agents.Parse(kind);
+    if (!Agents.IsValidKind(kind))
+        return McpResult(id, new
+        {
+            content = new[] { new { type = "text", text = $"unknown kind '{kind}'; use one of: {string.Join(", ", Agents.Kinds)}" } },
+            isError = true
+        });
     if (!string.IsNullOrEmpty(command))
     {
         string? problem =
-            kind == "claude-resume" ? "command (initial prompt) is not supported with kind=claude-resume; use kind=claude" :
-            kind == "claude" && Session.FindClaude() == null ? "claude not found on PATH (neither claude.exe nor an npm claude.cmd with node); cannot pass an initial prompt" :
+            agentKind is { Resume: true } ? $"command (initial prompt) is not supported with kind={kind}; use kind={agentKind.Value.Agent.Id}" :
+            agentKind is { } ak && ak.Agent.Find() == null ? $"{ak.Agent.Exe} not found on PATH; cannot pass an initial prompt" :
             Session.EncodedCommandLength(kind, command) > 32000 ? $"command ({command.Length} chars) exceeds the Windows command-line limit once encoded. Write longer instructions to a file and pass a short command/prompt that refers to it." :
             null;
         if (problem != null)
@@ -1540,11 +1598,11 @@ sealed class Session : IDisposable
     // The log this session shows: reported, else its current guess. Other tabs
     // exclude it from their guesses, so two Claude tabs in one project folder
     // don't both claim the same file.
-    public string? ClaimedTranscript { get { lock (_lock) return _transcript ?? _transcriptGuess; } }
+    public string? ClaimedTranscript { get { lock (_lock) return (_transcript ?? _transcriptGuess) is { } p ? Transcript.ClaimKey(p) : null; } }
 
     public void SetTranscript(string path) { lock (_lock) _transcript = path; }
 
-    /// <summary>The session's Claude conversation log, or null if none can be found yet.</summary>
+    /// <summary>The session's agent conversation log, or null if none can be found yet.</summary>
     public string? TranscriptPath(ISet<string> claimedElsewhere)
     {
         string? cwd, reported, guess, kind;
@@ -1555,8 +1613,8 @@ sealed class Session : IDisposable
             lock (_lock) _servedTranscripts.Add(reported);
             return reported;
         }
-        if (cwd == null || kind == "powershell") return null;
-        guess = Transcript.Guess(cwd, launched, guess, claimedElsewhere);
+        if (cwd == null || Agents.Parse(kind) is not { } ak) return null;
+        guess = Transcript.Guess(ak.Agent.Id, cwd, launched, guess, claimedElsewhere);
         lock (_lock)
         {
             _transcriptGuess = guess;
@@ -1569,6 +1627,13 @@ sealed class Session : IDisposable
 
     public void Launch(string kind, string? projectId, SettingsManager sm, string sid, string sidShort, Action<string> log, string? defaultCommand = null)
     {
+        // An unknown kind launches nothing, so the tab stays unlaunched and is reaped.
+        var agentKind = Agents.Parse(kind);
+        if (!Agents.IsValidKind(kind))
+        {
+            log($"SESSION LAUNCH sid={sidShort}… rejected unknown kind={kind}");
+            return;
+        }
         lock (_lock)
         {
             if (_launched) return;
@@ -1598,18 +1663,19 @@ sealed class Session : IDisposable
             var current = sm.Load();
             var project = current.Projects.FirstOrDefault(p => p.Id == projectId);
             cwd = project?.Directory ?? home;
-            if (kind == "claude" && !string.IsNullOrEmpty(defaultCommand) && FindClaude() is { } claude)
+            var (agent, resume) = agentKind!.Value;
+            if (!resume && !string.IsNullOrEmpty(defaultCommand) && agent.Find() is { } exe)
             {
                 // Spawned directly, not via cmd.exe /K, which re-parses % ^ & ", drops newlines and
                 // caps the line at 8191 chars. Verbatim because Porta.Pty's quoting mishandles \".
-                app = claude.App;
-                cmd = [string.Join(' ', [.. claude.Args, QuoteClaudePrompt(defaultCommand)])];
+                app = exe.App;
+                cmd = [string.Join(' ', [.. exe.Args, .. agent.PromptArgs, Agents.QuotePrompt(defaultCommand)])];
                 verbatim = true;
             }
             else
             {
                 app = Path.Combine(Environment.SystemDirectory, "cmd.exe");
-                cmd = kind == "claude-resume" ? ["/K", "claude", "--resume"] : ["/K", "claude"];
+                cmd = ["/K", agent.Exe, .. (resume ? agent.ResumeArgs : [])];
             }
         }
 
@@ -1617,7 +1683,7 @@ sealed class Session : IDisposable
         log($"SESSION LAUNCH sid={sidShort}… kind={kind} cwd={cwd}");
 
         var env = new Dictionary<string, string>();
-        if (kind != "powershell")
+        if (agentKind != null)
         {
             foreach (System.Collections.DictionaryEntry de in System.Environment.GetEnvironmentVariables())
                 env[(string)de.Key] = de.Value?.ToString() ?? "";
@@ -1645,71 +1711,12 @@ sealed class Session : IDisposable
         _ = Task.Run(ReadLoop);
     }
 
-    /// <summary>
-    /// How to spawn Claude directly (no cmd.exe): the native claude.exe, or for an npm install
-    /// (claude.cmd shim) node.exe + the package's cli.js, which is what the shim runs.
-    /// Args are already quoted for a verbatim command line. Null if neither is found on PATH.
-    /// </summary>
-    public static (string App, string[] Args)? FindClaude()
-    {
-        foreach (var dir in PathDirs())
-        {
-            var exe = Path.Combine(dir, "claude.exe");
-            if (File.Exists(exe)) return (exe, []);
-            if (File.Exists(Path.Combine(dir, "claude.cmd")))
-            {
-                var cli = Path.Combine(dir, "node_modules", "@anthropic-ai", "claude-code", "cli.js");
-                var localNode = Path.Combine(dir, "node.exe");
-                var node = File.Exists(localNode) ? localNode : FindOnPath("node.exe");
-                if (File.Exists(cli) && node != null) return (node, [QuoteWindowsArg(cli)]);
-            }
-        }
-        return null;
-    }
-
-    static string? FindOnPath(string file) =>
-        PathDirs().Select(d => Path.Combine(d, file)).FirstOrDefault(File.Exists);
-
-    static IEnumerable<string> PathDirs()
-    {
-        foreach (var raw in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
-        {
-            string dir;
-            try { dir = Path.GetFullPath(raw.Trim().Trim('"')); }
-            catch (Exception e) when (e is ArgumentException or NotSupportedException or PathTooLongException) { continue; }
-            yield return dir;
-        }
-    }
-
     static string EncodePowerShell(string command) =>
         Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(command));
 
-    static string QuoteClaudePrompt(string prompt) =>
-        QuoteWindowsArg(prompt.StartsWith('-') ? " " + prompt : prompt);
-
     /// <summary>Length the command adds to the spawned process's command line (Windows caps the whole line at 32767).</summary>
     public static int EncodedCommandLength(string kind, string command) =>
-        kind == "powershell" ? EncodePowerShell(command).Length : QuoteClaudePrompt(command).Length;
-
-    /// <summary>
-    /// Quotes one argument so CommandLineToArgvW / the MSVC CRT parse it back byte-for-byte:
-    /// backslashes are literal except before a quote, where they are doubled and the quote is escaped.
-    /// </summary>
-    static string QuoteWindowsArg(string arg)
-    {
-        var sb = new System.Text.StringBuilder(arg.Length + 2).Append('"');
-        int backslashes = 0;
-        foreach (var ch in arg)
-        {
-            if (ch == '\\') { backslashes++; continue; }
-            if (ch == '"') sb.Append('\\', backslashes * 2 + 1);
-            else sb.Append('\\', backslashes);
-            sb.Append(ch);
-            backslashes = 0;
-        }
-        sb.Append('\\', backslashes * 2).Append('"');
-        return sb.ToString();
-    }
+        kind == "powershell" ? EncodePowerShell(command).Length : Agents.QuotePrompt(command).Length + 4;
 
     async Task ReadLoop()
     {
@@ -2084,6 +2091,10 @@ class ProjectSettings
 
     [JsonPropertyName("color")]
     public string Color { get; set; } = "#4a90d9";
+
+    // The agent the project's Open/Resume buttons launch (an AgentDef.Id).
+    [JsonPropertyName("agent")]
+    public string Agent { get; set; } = "claude";
 }
 
 class ButtonConfig

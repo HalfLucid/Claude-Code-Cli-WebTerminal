@@ -253,8 +253,18 @@ window.ButtonBar = (function(){
 
   function hidePopout(){ popout.style.display = 'none'; }
 
-  function showModelPopout(el){ showPopout(MODEL_OPTIONS, el); }
-  function showEffortPopout(el){ showPopout(EFFORT_OPTIONS, el); }
+  // agy's models and effort levels are set in one picker (/model, effort with
+  // ←/→), which the history view mirrors as a menu; there are no shortcuts.
+  function openAgyPicker(){
+    var a = AgentInfo.of(TabManager.getActive());
+    if(!a || a.id !== 'agy') return false;
+    hidePopout();
+    resetTa();
+    sendActive('/model\r');
+    return true;
+  }
+  function showModelPopout(el){ if(!openAgyPicker()) showPopout(MODEL_OPTIONS, el); }
+  function showEffortPopout(el){ if(!openAgyPicker()) showPopout(EFFORT_OPTIONS, el); }
 
   document.addEventListener('click', e => {
     if(!e.target.closest('.popout') && !e.target.closest('.btn')) hidePopout();

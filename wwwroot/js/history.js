@@ -78,10 +78,10 @@ window.HistoryView = (function(){
     return tab.hist;
   }
 
-  // Each tab remembers its view (tab.view: 'html' or 'text'). Claude tabs
-  // start in HTML; PowerShell has no Claude log, so it starts in the terminal.
+  // Each tab remembers its view (tab.view: 'html' or 'text'). Agent tabs
+  // start in HTML; PowerShell has no conversation log, so it starts in the terminal.
   function wantsHtml(tab){
-    return tab.view ? tab.view === 'html' : tab.kind !== 'powershell';
+    return tab.view ? tab.view === 'html' : !!AgentInfo.of(tab);
   }
 
   // HTML/TEXT button: switches the tab's view and remembers it.
@@ -134,6 +134,7 @@ window.HistoryView = (function(){
     menuSig = '';
     updateStatus();   // drop the previous tab's line before the first frame
     updateTasks();
+    suggestion = null;   // forces the placeholder to be set: it names this tab's agent
     updateSuggestion();
     hookMenu(tab);
     scheduleMenu();
@@ -276,7 +277,10 @@ window.HistoryView = (function(){
   // touch keyboards have no Shift, so there a new line needs a paste.
   const touch = window.matchMedia && matchMedia('(pointer: coarse)').matches;
 
-  const DEFAULT_PLACEHOLDER = touch ? 'Message Claude…' : 'Message Claude…  (Enter sends, Shift+Enter new line)';
+  function defaultPlaceholder(){
+    const m = 'Message ' + AgentInfo.nameOf(openTab) + '…';
+    return touch ? m : m + '  (Enter sends, Shift+Enter new line)';
+  }
 
   function buildInput(){
     inputBar = document.createElement('div');
@@ -284,7 +288,7 @@ window.HistoryView = (function(){
     msgEl = document.createElement('textarea');
     msgEl.className = 'history-msg';
     msgEl.rows = 2;
-    msgEl.placeholder = DEFAULT_PLACEHOLDER;
+    msgEl.placeholder = defaultPlaceholder();
     msgEl.setAttribute('autocapitalize', 'sentences');
     msgEl.addEventListener('input', growInput);
     msgEl.addEventListener('keydown', e => {
@@ -297,7 +301,7 @@ window.HistoryView = (function(){
     });
     const send = document.createElement('button');
     send.className = 'history-send';
-    send.title = 'Send to Claude';
+    send.title = 'Send';
     send.innerHTML = '&#10148;';
     // pointerdown keeps the mobile keyboard up (no blur before the click).
     send.addEventListener('pointerdown', e => e.preventDefault());
@@ -531,14 +535,15 @@ window.HistoryView = (function(){
       if(s.trim()) parts.push(s.trim());
     }
     const out = parts.join(' ');
-    return /^Try "/.test(out) ? '' : out;
+    // agy's mode placeholder ("Auto mode: … (shift+tab to cycle)") isn't a suggestion either.
+    return /^Try "/.test(out) || /\(shift\+tab to cycle\)$/.test(out) ? '' : out;
   }
 
   function updateSuggestion(){
     const s = openTab && openTab.term ? parseSuggestion(openTab.term) : '';
     if(s === suggestion) return;
     suggestion = s;
-    if(msgEl) msgEl.placeholder = s ? s + (touch ? '' : '   (Tab to accept)') : DEFAULT_PLACEHOLDER;
+    if(msgEl) msgEl.placeholder = s ? s + (touch ? '' : '   (Tab to accept)') : defaultPlaceholder();
   }
 
   function acceptSuggestion(){
@@ -552,10 +557,11 @@ window.HistoryView = (function(){
   // (with the todo list, if any, between), so look in the rows above the
   // box's top rule. Only the in-progress form (with "…") counts; the
   // past-tense "✻ Worked for 5m" left after a turn doesn't.
-  const SPINNER = /^\s*[·✢✳✶✻✽*]\s+(\S.{0,80}?(?:…|\.\.\.))\s*(?:\((.*?)\)?)?\s*$/;   // ")" may wrap off a narrow line
+  // agy draws a braille spinner in the same place ("⣽  Generating...").
+  const SPINNER = /^\s*[·✢✳✶✻✽*⠁-⣿]\s+(\S.{0,80}?(?:…|\.\.\.))\s*(?:\((.*?)\)?)?\s*$/;   // ")" may wrap off a narrow line
   // After a turn that left a background agent running: "✻ Waiting for 1
   // background agent to finish" (no "…", so SPINNER misses it).
-  const WAITING = /^\s*[·✢✳✶✻✽*]\s+(Waiting for .+? to finish)\s*$/;
+  const WAITING = /^\s*[·✢✳✶✻✽*⠁-⣿]\s+(Waiting for .+? to finish)\s*$/;
   let statusEl2 = null, statusSig = '';
   let tasksEl = null, tasksSig = '';
 
@@ -631,6 +637,30 @@ window.HistoryView = (function(){
     statusEl2.classList.toggle('show', !!s);
   }
 
+  // agy has no hook that fires when it waits for approval (Claude's
+  // PermissionRequest hook raises tab_attention), so every agy tab's live
+  // screen is watched for its approval prompt ("Requesting permission for:"
+  // above a numbered list ending in "No, cancel"), open in the overlay or not.
+  // Each browser flags the tab for itself.
+  const watched = new WeakSet();
+  function watch(tab){
+    const agent = AgentInfo.of(tab);
+    if(!tab.term || !agent || agent.id !== 'agy' || watched.has(tab.term)) return;
+    watched.add(tab.term);
+    let timer = null, asking = false;
+    const check = () => {
+      timer = null;
+      // A replay passes through old screens; only the live one counts.
+      if(tab.replaying){ timer = setTimeout(check, 300); return; }
+      const m = parseMenu(tab.term);
+      const now = !!m && (/Requesting permission/i.test(m.title) || m.items.some(l => /^\d+[.)]\s+No\b/.test(l[0])));
+      if(now && !asking && window.raiseAttention) window.raiseAttention(tab.sid, 'permission');
+      asking = now;
+    };
+    // A timer, not requestAnimationFrame, which doesn't run in a hidden page.
+    tab.term.onWriteParsed(() => { if(!timer) timer = setTimeout(check, 300); });
+  }
+
   function hookMenu(tab){
     if(!tab.term || menuHooked.has(tab.term)) return;
     menuHooked.add(tab.term);
@@ -668,7 +698,9 @@ window.HistoryView = (function(){
       const s = L[i], k = indent(s);
       if(isPlainRule(s)){ if(isNumRow(L[i + 1])) continue; return null; }
       if(k < 0 || !/[❯›>]/.test(s[k]) || s[k + 1] !== ' ' || !s.slice(k + 2).trim()) continue;
-      if(i > 0 && isBoxEdge(L[i - 1]) && !isNumRow(s)) return null;   // the prompt line itself
+      // The prompt line itself (its rule starts at or left of the pointer;
+      // agy's /model search field has an indented underline above its list).
+      if(i > 0 && isBoxEdge(L[i - 1]) && indent(L[i - 1]) <= k && !isNumRow(s)) return null;
       y = i; c = k; break;
     }
     if(y < 0) return null;
@@ -677,7 +709,10 @@ window.HistoryView = (function(){
     const near = i => i === y || indent(L[i]) >= col;
     const crossable = i => isPlainRule(L[i]) && i > 0 && i + 1 < rows && near(i - 1) && near(i + 1) &&
       (isNumRow(L[i - 1]) || isNumRow(L[i + 1]));
-    const inMenu = i => { const k = indent(L[i]); return k < 0 || crossable(i) || (k >= col && !isBoxEdge(L[i])); };
+    // agy's key hint ("↑/↓ Navigate · enter Confirm") sits at the option
+    // column, a blank line under the list; it isn't an option.
+    const isKeyHint = s => /^\s*↑\/↓\s/.test(s);
+    const inMenu = i => { const k = indent(L[i]); return k < 0 || crossable(i) || (k >= col && !isBoxEdge(L[i]) && !isKeyHint(L[i])); };
     let a = y, b = y;
     for(let i = y - 1, blanks = 0; i >= 0 && inMenu(i); i--){
       if(indent(L[i]) < 0){ if(++blanks > 1) break; } else { blanks = 0; a = i; }
@@ -704,9 +739,14 @@ window.HistoryView = (function(){
         cur.lines.push(text(i));
         if(i === y) sel = cur;
       }
+      // A blank line splitting a one-row-per-option list from agy's /model
+      // effort slider ("Effort  ◂ …  ▸") isn't the block layout: read it per row.
+      const slider = items.some(it => it !== sel && /[◂▸]/.test(it.lines[0]));
       // Shorter blocks are headings (the picker's project name), not options.
       if(sel) items = items.filter(it => it.lines.length >= sel.lines.length);
-    } else {
+      if(slider && items.length < 2){ gapped = false; items = []; sel = null; }
+    }
+    if(!gapped){
       for(let i = a; i <= b; i++){
         const k = indent(L[i]);
         if(k < 0 || rule(i)) continue;
@@ -720,17 +760,21 @@ window.HistoryView = (function(){
       // A numbered menu (approvals, /model): only the numbered rows are options.
       const numbered = items.filter(it => /^\d+[.)]\s/.test(it.lines[0]) || it.lines[0] === 'Submit');
       if(numbered.length >= 2) items = numbered;
+      // agy's /model draws its effort slider ("Effort  ◂ ●━━◉──○ ▸") at the
+      // option column; it is set with ←/→, not chosen.
+      items = items.filter(it => it === sel || !/[◂▸]/.test(it.lines[0]));
     }
     const idx = items.indexOf(sel);
     if(idx < 0 || items.length < 2) return null;
     // Question: the lines above, up to a rule, minus boxes (the search field).
     const title = [];
-    for(let i = a - 1; i >= 0 && i >= a - 10 && !isPlainRule(L[i]); i--)
+    for(let i = a - 1; i >= 0 && i >= a - 10 && !(isPlainRule(L[i]) && indent(L[i]) === 0); i--)
       if(L[i].trim() && !boxed[i] && !isBoxEdge(L[i])) title.unshift(L[i].trim());
     // Hint: the key help, the last block of text under the list.
     let hint = [], gap = true;
     for(let i = b + 1; i < rows; i++){
-      if(indent(L[i]) < 0){ gap = true; continue; }
+      // A two-column status footer ("esc to cancel      auto · Gemini 4 Neon · high") isn't key help.
+      if(indent(L[i]) < 0 || /\S\s{10,}\S/.test(L[i]) || indent(L[i]) > 40){ gap = true; continue; }
       if(gap){ hint = []; gap = false; }
       hint.push(L[i].trim());
     }
@@ -918,9 +962,9 @@ window.HistoryView = (function(){
       if(openTab !== tab) return;
       statusEl.textContent = '';
       if(!d.path){
-        if(!st.path) st.el.dataset.empty = tab.kind === 'powershell'
-          ? 'History is only available for Claude tabs.'
-          : 'No Claude conversation found for this tab yet. It appears once Claude has written its first message.';
+        if(!st.path) st.el.dataset.empty = !AgentInfo.of(tab)
+          ? 'History is only available for agent tabs (Claude, agy).'
+          : 'No ' + AgentInfo.nameOf(tab) + ' conversation found for this tab yet. It appears once ' + AgentInfo.nameOf(tab) + ' has written its first message.';
         return;
       }
       const stick = first || bodyEl.scrollHeight - bodyEl.scrollTop - bodyEl.clientHeight < 40;
@@ -1182,5 +1226,5 @@ window.HistoryView = (function(){
     return out.join('');
   }
 
-  return { toggle, restore, hide, isOpen, focus, attach, key, insert, scrollPage, jump, togglePin, isPinned };
+  return { toggle, restore, hide, isOpen, focus, attach, key, insert, scrollPage, jump, togglePin, isPinned, watch };
 })();

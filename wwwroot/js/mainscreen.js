@@ -58,16 +58,17 @@ window.MainScreen = (function(){
       const actions = document.createElement('div');
       actions.className = 'project-actions';
 
-      const btnClaude = document.createElement('button');
-      btnClaude.className = 'launch-btn';
-      btnClaude.textContent = 'Open Claude';
-      btnClaude.addEventListener('click', () => launchSession('claude', p.id, p.name, p.color));
-      actions.appendChild(btnClaude);
+      const agent = AgentInfo.get(p.agent);
+      const btnOpen = document.createElement('button');
+      btnOpen.className = 'launch-btn';
+      btnOpen.textContent = 'Open ' + agent.name;
+      btnOpen.addEventListener('click', () => launchSession(agent.id, p.id, p.name, p.color));
+      actions.appendChild(btnOpen);
 
       const btnResume = document.createElement('button');
       btnResume.className = 'launch-btn';
-      btnResume.textContent = 'Resume Claude';
-      btnResume.addEventListener('click', () => launchSession('claude-resume', p.id, p.name + ' (R)', p.color));
+      btnResume.textContent = 'Resume ' + agent.name;
+      btnResume.addEventListener('click', () => launchSession(agent.id + '-resume', p.id, p.name + ' (R)', p.color));
       actions.appendChild(btnResume);
 
       const btnEdit = document.createElement('button');
@@ -135,6 +136,7 @@ window.MainScreen = (function(){
     document.getElementById('proj-name').value = '';
     document.getElementById('proj-dir').value = '';
     document.getElementById('proj-color').value = '#4a90d9';
+    document.getElementById('proj-agent').value = 'claude';
     document.getElementById('project-modal').classList.add('visible');
   });
 
@@ -146,12 +148,13 @@ window.MainScreen = (function(){
     const name = document.getElementById('proj-name').value.trim();
     const dir = document.getElementById('proj-dir').value.trim();
     const color = document.getElementById('proj-color').value;
+    const agent = document.getElementById('proj-agent').value;
     if(!name || !dir) return;
 
     if(editingProjectId){
-      await Settings.updateProject(editingProjectId, name, dir, color);
+      await Settings.updateProject(editingProjectId, name, dir, color, agent);
     } else {
-      await Settings.addProject(name, dir, color);
+      await Settings.addProject(name, dir, color, agent);
     }
     document.getElementById('project-modal').classList.remove('visible');
     refresh();
@@ -163,6 +166,7 @@ window.MainScreen = (function(){
     document.getElementById('proj-name').value = p.name;
     document.getElementById('proj-dir').value = p.directory;
     document.getElementById('proj-color').value = p.color;
+    document.getElementById('proj-agent').value = AgentInfo.get(p.agent).id;
     document.getElementById('project-modal').classList.add('visible');
   }
 

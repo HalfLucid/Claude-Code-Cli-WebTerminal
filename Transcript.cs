@@ -20,7 +20,7 @@ sealed record TranscriptItem(string K, string? Text = null, string? Name = null,
 /// one width, so the browser can show history that reflows to any width.
 /// The format is internal to Claude Code: unknown entries are skipped.
 /// </summary>
-static class Transcript
+static partial class Transcript
 {
     public static readonly JsonSerializerOptions JsonOpts = new(JsonSerializerDefaults.Web)
     {
@@ -36,7 +36,10 @@ static class Transcript
     public static string ProjectsRoot =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude", "projects");
 
-    /// <summary>True for a .jsonl file under ~/.claude/projects (the only files served).</summary>
+    /// <summary>
+    /// True for a Claude log (.jsonl under ~/.claude/projects) or an agy log
+    /// (see <see cref="IsAgyPath"/>): the only files served.
+    /// </summary>
     public static bool IsValidPath(string? path)
     {
         if (string.IsNullOrWhiteSpace(path)) return false;
@@ -44,10 +47,15 @@ static class Transcript
         {
             var full = Path.GetFullPath(path);
             return full.StartsWith(ProjectsRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                   && full.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase);
+                   && full.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)
+                || IsAgyPath(full);
         }
         catch { return false; }
     }
+
+    /// <summary>The session's log when no hook has reported it, for the tab's agent.</summary>
+    public static string? Guess(string agent, string cwd, DateTime launchedUtc, string? current, ISet<string> claimed) =>
+        agent == "agy" ? AgyGuess(launchedUtc, current, claimed) : Guess(cwd, launchedUtc, current, claimed);
 
     // Claude names a project's log folder after its cwd with every
     // non-alphanumeric character replaced: C:\Dev\webterm -> C--Dev-webterm.
@@ -61,13 +69,19 @@ static class Transcript
     /// stopped being written (/clear starts a new file). Can pick a Claude running outside WebTerm in
     /// the same folder; the SessionStart hook reports the exact file.
     /// </summary>
-    public static string? Guess(string cwd, DateTime launchedUtc, string? current, ISet<string> claimed)
+    static string? Guess(string cwd, DateTime launchedUtc, string? current, ISet<string> claimed)
     {
         var dir = ProjectFolder(cwd);
         if (!Directory.Exists(dir)) return null;
         FileInfo[] files;
         try { files = new DirectoryInfo(dir).GetFiles("*.jsonl"); }
         catch { return current; }
+        return Pick(files, launchedUtc, current, claimed);
+    }
+
+    // The newest unclaimed log written since launch, sticking to current (see Guess).
+    static string? Pick(IEnumerable<FileInfo> files, DateTime launchedUtc, string? current, ISet<string> claimed)
+    {
         var since = launchedUtc.AddMinutes(-1);
         var candidates = files.Where(f => f.LastWriteTimeUtc >= since && !claimed.Contains(f.FullName)).ToList();
         if (current != null && File.Exists(current) && !claimed.Contains(current))
@@ -94,6 +108,7 @@ static class Transcript
     public static (long Offset, List<TranscriptItem> Items, bool Restarted) Read(string path, long from)
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        Action<JsonElement, long, List<TranscriptItem>> process = IsAgyPath(path) ? ProcessAgy : Process;
         var restarted = false;
         if (from < 0 || from > fs.Length) { from = 0; restarted = true; }
         fs.Seek(from, SeekOrigin.Begin);
@@ -115,10 +130,10 @@ static class Transcript
                 if (partial.Length > 0)
                 {
                     partial.Write(buf, start, nl - start);
-                    ParseLine(partial.GetBuffer().AsSpan(0, (int)partial.Length), consumed, items);
+                    ParseLine(partial.GetBuffer().AsSpan(0, (int)partial.Length), consumed, items, process);
                     partial.SetLength(0);
                 }
-                else ParseLine(buf.AsSpan(start, nl - start), consumed, items);
+                else ParseLine(buf.AsSpan(start, nl - start), consumed, items, process);
                 start = nl + 1;
                 consumed = read + start;
             }
@@ -141,14 +156,14 @@ static class Transcript
     }
 
     // at: the line's byte offset in the file, which addresses its images.
-    static void ParseLine(ReadOnlySpan<byte> line, long at, List<TranscriptItem> items)
+    static void ParseLine(ReadOnlySpan<byte> line, long at, List<TranscriptItem> items, Action<JsonElement, long, List<TranscriptItem>> process)
     {
         if (line.IsEmpty) return;
         try
         {
             var reader = new Utf8JsonReader(line);
             using var doc = JsonDocument.ParseValue(ref reader);
-            Process(doc.RootElement, at, items);
+            process(doc.RootElement, at, items);
         }
         catch (JsonException) { }
     }

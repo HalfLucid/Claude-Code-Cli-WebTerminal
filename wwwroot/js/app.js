@@ -445,7 +445,7 @@
 
     var title = document.createElement('div');
     title.className = 'copy-title';
-    title.textContent = label ? ('Claude wants to copy: ' + label) : 'Claude wants to copy text';
+    title.textContent = label ? ('Copy: ' + label) : 'Copy text';
     box.appendChild(title);
 
     var pre = document.createElement('textarea');
@@ -602,19 +602,7 @@
       if(tab) TabManager.removeTab(tab, false);   // server already disposed it
     });
     es.addEventListener('tab_attention', function(e){
-      var data = JSON.parse(e.data);
-      TabManager.setAttention(data.sid, 'permission');
-      var tab = TabManager.getAll().find(function(t){ return t.sid === data.sid; });
-      var isActiveVisible = tab && TabManager.getActive() === tab && document.visibilityState === 'visible';
-      if(!isActiveVisible){
-        startTitleFlash('⚠ Approval needed');
-        if('Notification' in window && Notification.permission === 'granted'){
-          new Notification('Claude needs approval', {
-            body: 'Tab: ' + (tab ? tab.label : 'Unknown'),
-            tag: 'webterm-attention-' + data.sid
-          });
-        }
-      }
+      window.raiseAttention(JSON.parse(e.data).sid, 'permission');
     });
     es.addEventListener('show_file', function(e){
       var data = JSON.parse(e.data);
@@ -625,21 +613,28 @@
       receiveCopyText(data.text || '', data.label);
     });
     es.addEventListener('tab_idle', function(e){
-      var data = JSON.parse(e.data);
-      TabManager.setAttention(data.sid, 'idle');
-      var tab = TabManager.getAll().find(function(t){ return t.sid === data.sid; });
-      var isActiveVisible = tab && TabManager.getActive() === tab && document.visibilityState === 'visible';
-      if(!isActiveVisible){
-        startTitleFlash('✓ Claude finished');
-        if('Notification' in window && Notification.permission === 'granted'){
-          new Notification('Claude finished', {
-            body: 'Tab: ' + (tab ? tab.label : 'Unknown'),
-            tag: 'webterm-idle-' + data.sid
-          });
-        }
-      }
+      window.raiseAttention(JSON.parse(e.data).sid, 'idle');
     });
   })();
+
+  // Flags a tab ('permission' or 'idle') and, unless it's the tab being
+  // looked at, flashes the title and shows a notification. From the hooks'
+  // SSE events, and from HistoryView.watch for agy's approval prompts.
+  window.raiseAttention = function(sid, kind){
+    TabManager.setAttention(sid, kind);
+    var tab = TabManager.getAll().find(function(t){ return t.sid === sid; });
+    var isActiveVisible = tab && TabManager.getActive() === tab && document.visibilityState === 'visible';
+    if(isActiveVisible) return;
+    var name = AgentInfo.nameOf(tab);
+    var ask = kind === 'permission';
+    startTitleFlash(ask ? '⚠ Approval needed' : '✓ ' + name + ' finished');
+    if('Notification' in window && Notification.permission === 'granted'){
+      new Notification(ask ? name + ' needs approval' : name + ' finished', {
+        body: 'Tab: ' + (tab ? tab.label : 'Unknown'),
+        tag: (ask ? 'webterm-attention-' : 'webterm-idle-') + sid
+      });
+    }
+  };
 
   ta.focus();
 })();

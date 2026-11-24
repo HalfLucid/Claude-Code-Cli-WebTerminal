@@ -51,7 +51,7 @@
       <button class="launch-btn powershell-btn" id="launch-powershell">&#9654; PowerShell</button>
     </div>
     <div class="launch-section">
-      <h2 class="section-title">Claude Projects</h2>
+      <h2 class="section-title">Projects</h2>
       <div id="project-list"></div>
       <button class="add-project-btn" id="btn-add-project">+ Add Project</button>
     </div>
@@ -63,6 +63,7 @@
     <label>Name<input type="text" id="proj-name" placeholder="My Project"/></label>
     <label>Directory<input type="text" id="proj-dir" placeholder="C:\path\to\project"/></label>
     <label>Color<input type="color" id="proj-color" value="#4a90d9"/></label>
+    <label>Agent<select id="proj-agent"><option value="claude">Claude Code</option><option value="agy">agy (Antigravity CLI)</option></select></label>
     <div class="modal-actions">
       <button class="modal-save" id="proj-save">Save</button>
       <button class="modal-cancel" id="proj-cancel">Cancel</button>
