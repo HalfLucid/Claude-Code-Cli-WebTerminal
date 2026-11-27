@@ -38,6 +38,13 @@ window.HistoryView = (function(){
       if(d.open || !d.matches || !d.matches('.h-tool, .h-compact')) return;
       if(d.getBoundingClientRect().top < bodyEl.getBoundingClientRect().top) d.scrollIntoView({block: 'start'});
     }, true);
+    // A menu on screen takes the arrows and Enter while focus is on the body
+    // (where it sits after opening), and the arrows on a menu button reached
+    // with Tab (Enter there clicks that button), see menuKey.
+    bodyEl.addEventListener('keydown', e => {
+      if(e.target === bodyEl) menuKey(e);
+      else if(e.key !== 'Enter' && e.target.tagName === 'BUTTON' && e.target.closest('.h-menu')) menuKey(e);
+    });
     // Unpinned, the message box scrolls in and out of view.
     bodyEl.addEventListener('scroll', clampButtons, { passive: true });
     window.addEventListener('resize', clampButtons);
@@ -117,8 +124,12 @@ window.HistoryView = (function(){
 
   // The message box is one element shared by all tabs, so its text is kept
   // per tab: saved when the overlay leaves a tab, restored when it opens one.
+  // Mid-recall, the draft is what was being typed, not the recalled message.
   function saveDraft(){
-    if(openTab && msgEl) stateOf(openTab).draft = msgEl.value;
+    if(!openTab || !msgEl) return;
+    const st = stateOf(openTab);
+    st.draft = st.recall ? st.recall.draft : msgEl.value;
+    st.recall = null;
   }
 
   function show(tab){
@@ -127,6 +138,7 @@ window.HistoryView = (function(){
     openTab = tab;
     const st = stateOf(tab);
     msgEl.value = st.draft || '';
+    st.recall = null;
     renderAttach();
     // The message box ends the conversation, like Claude's prompt box ends the
     // terminal; pinned, it sticks to the bottom of the view while scrolling.
@@ -184,6 +196,7 @@ window.HistoryView = (function(){
     // own [Image #n]; the text can't then go through #ta's diff, which would
     // race the timed pastes.
     const st = stateOf(tab);
+    st.recall = null;   // a recalled message goes to the terminal as the draft
     if(st.attach && st.attach.length){
       const parts = st.attach.map(p => quotePath(p) + ' ');
       if(text.trim()) parts.push(text);
@@ -290,8 +303,12 @@ window.HistoryView = (function(){
     msgEl.rows = 2;
     msgEl.placeholder = defaultPlaceholder();
     msgEl.setAttribute('autocapitalize', 'sentences');
-    msgEl.addEventListener('input', growInput);
+    msgEl.addEventListener('input', () => { if(openTab) stateOf(openTab).recall = null; growInput(); });
     msgEl.addEventListener('keydown', e => {
+      // An empty box with nothing attached leaves the arrows and Enter to a
+      // menu on screen (with attachments, Enter sends them).
+      if(!msgEl.value && openTab && !(stateOf(openTab).attach || []).length && menuKey(e)) return;
+      if(recallKey(e)) return;
       if(e.key === 'Enter' && !e.isComposing && (e.ctrlKey || touch || !e.shiftKey)){ e.preventDefault(); sendMessage(); }
       // Tab in an empty box takes Claude's suggested next prompt (as Tab does in its prompt).
       else if(e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.altKey && !msgEl.value && suggestion){
@@ -313,6 +330,49 @@ window.HistoryView = (function(){
     attachEl = div('history-attach');
     inputBar.append(statusEl2, tasksEl, attachEl, msgEl, send);
     return inputBar;
+  }
+
+  // While Claude shows a menu (approval, picker, question), ↑/↓/←/→ and Enter
+  // go to it, as they would in the terminal. True if the key was taken.
+  const MENU_KEYS = { ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowLeft: '\x1b[D', ArrowRight: '\x1b[C', Enter: '\r' };
+  function menuKey(e){
+    const seq = MENU_KEYS[e.key];
+    if(!seq || !lastMenu || !menuEl || !menuEl.isConnected || e.isComposing || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return false;
+    e.preventDefault();
+    pressKeys([seq]);
+    return true;
+  }
+
+  // ↑ recalls earlier messages (newest first), as ↑ does in Claude's prompt;
+  // ↓ goes forward again, back to what was being typed. It starts in an empty
+  // box or with the cursor at the very start (not just on the first line: a
+  // long line wrapped on a phone needs ↑ to move between its rows), then
+  // steps on while the cursor is on the recalled text's first line (↑) or
+  // last line (↓). Sources are the user's entries in the log (st.sent, see
+  // render), so messages typed in the terminal count too.
+  function recallKey(e){
+    if((e.key !== 'ArrowUp' && e.key !== 'ArrowDown') || e.isComposing || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return false;
+    if(!openTab || msgEl.selectionStart !== msgEl.selectionEnd) return false;
+    const st = stateOf(openTab), list = st.sent || [];
+    const v = msgEl.value, pos = msgEl.selectionStart;
+    let r = st.recall;
+    if(e.key === 'ArrowUp'){
+      if(r ? v.lastIndexOf('\n', pos - 1) !== -1 : v && pos !== 0) return false;
+      const i = r ? r.i - 1 : list.length - 1;
+      if(i < 0) return false;
+      if(!r) r = { i, draft: v };
+      r.i = i;
+    } else {
+      if(!r || v.indexOf('\n', pos) !== -1) return false;   // not recalling, or not on the last line
+      r.i++;
+    }
+    e.preventDefault();
+    const text = r.i < list.length ? list[r.i] : r.draft;
+    st.recall = r.i < list.length ? r : null;
+    msgEl.value = text;
+    msgEl.setSelectionRange(text.length, text.length);
+    growInput();
+    return true;
   }
 
   // Files pasted or dropped while the overlay shows a tab are uploaded (as in
@@ -781,6 +841,24 @@ window.HistoryView = (function(){
     return { title: title.join('\n'), items: items.map(it => it.lines), sel: idx, hint: hint.join(' ') };
   }
 
+  // Devtools: webtermMenu() dumps the active tab's live screen (row number,
+  // indent, text) and what parseMenu made of it, and copies it to the
+  // clipboard, for when a menu on screen isn't mirrored.
+  window.webtermMenu = function(){
+    const tab = window.TabManager && TabManager.getActive();
+    if(!tab || !tab.term) return 'no active terminal';
+    const term = tab.term, buf = term.buffer.active, rows = [];
+    for(let i = 0; i < term.rows; i++){
+      const l = buf.getLine(buf.baseY + i), s = l ? l.translateToString(true) : '';
+      rows.push(String(i).padStart(3) + ' ' + String(s.search(/\S/)).padStart(3) + (l && l.isWrapped ? 'w' : ' ') + '|' + s);
+    }
+    const out = `cols=${term.cols} rows=${term.rows} cursor=${buf.cursorX},${buf.cursorY} replaying=${!!tab.replaying} overlay=${openTab === tab}\n` +
+      rows.join('\n') + '\n\nparseMenu: ' + JSON.stringify(parseMenu(term), null, 1);
+    try{ navigator.clipboard.writeText(out); }catch{}
+    console.log(out);
+    return 'copied (' + out.length + ' chars)';
+  };
+
   function updateMenu(){
     const tab = openTab;
     const m = tab && tab.term ? parseMenu(tab.term) : null;
@@ -900,6 +978,7 @@ window.HistoryView = (function(){
     parts.forEach((p, i) => setTimeout(() => Connection.send(tab, '\x1b[200~' + p + '\x1b[201~'), i * 40));
     setTimeout(() => Connection.send(tab, '\r'), (parts.length - 1) * 40 + 80);
     st.attach = [];
+    st.recall = null;
     renderAttach();
     msgEl.value = '';
     growInput();
@@ -951,13 +1030,21 @@ window.HistoryView = (function(){
     // Per tab: another tab's request still in flight mustn't delay this one.
     if(st.busy) return;
     st.busy = true;
+    // After sleep or a network switch a request can hang without ever failing;
+    // without a deadline busy would stay set and this tab would never poll again.
+    const ctl = new AbortController();
+    // 15 s for the headers; the body then gets 2 minutes, so a long log's
+    // first read on a slow link isn't aborted (and restarted) on every poll.
+    let deadline = setTimeout(() => ctl.abort(), 15000);
     try{
       const url = '/api/transcript/' + encodeURIComponent(tab.sid) +
         '?from=' + st.offset + '&path=' + encodeURIComponent(st.path || '');
-      const r = await fetch(url);
+      const r = await fetch(url, { signal: ctl.signal });
       if(openTab !== tab) return;
       if(r.status === 404){ st.el.dataset.empty = 'This session no longer exists on the server.'; return; }
       if(!r.ok){ statusEl.textContent = 'read failed, retrying'; return; }
+      clearTimeout(deadline);
+      deadline = setTimeout(() => ctl.abort(), 120000);
       const d = await r.json();
       if(openTab !== tab) return;
       statusEl.textContent = '';
@@ -979,6 +1066,7 @@ window.HistoryView = (function(){
     }catch{
       if(openTab === tab) statusEl.textContent = 'offline, retrying';
     }finally{
+      clearTimeout(deadline);
       st.busy = false;
     }
   }
@@ -997,10 +1085,23 @@ window.HistoryView = (function(){
     return el;
   }
 
+  // Recall list for ↑ in the message box (recallKey). Each text once, at its
+  // latest use, so re-reading a log after a reset doesn't duplicate it.
+  function remember(st, text){
+    text = (text || '').trim();
+    if(!text) return;
+    const list = st.sent || (st.sent = []);
+    const at = list.lastIndexOf(text);
+    if(at !== -1) list.splice(at, 1);
+    list.push(text);
+    if(list.length > 200) list.shift();
+  }
+
   function render(st, it){
     switch(it.k){
       case 'user': {
         st.el.appendChild(div('h-user', it.text || ''));
+        remember(st, it.text);
         break;
       }
       case 'assistant': {
@@ -1010,7 +1111,7 @@ window.HistoryView = (function(){
         break;
       }
       // Slash and `!` commands are what the user typed, so they get the same bubble.
-      case 'cmd': st.el.appendChild(div('h-user', it.text || '')); break;
+      case 'cmd': st.el.appendChild(div('h-user', it.text || '')); remember(st, it.text); break;
       case 'out': st.el.appendChild(pre('h-out', it.text || '')); break;
       case 'note': st.el.appendChild(div('h-note', it.text || '')); break;
       // Thumbnail, full size in the file viewer on click. In a tool result it

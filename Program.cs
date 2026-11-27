@@ -420,6 +420,7 @@ app.MapPost("/api/startup", async (HttpContext ctx) =>
 });
 
 // Rebuilds and relaunches WebTerm from its project folder once this process has exited, then exits.
+// When the exe isn't under a project folder (a published copy), it relaunches the same exe instead.
 // The replacement runs hidden (no window), so a failed build opens its output in Notepad instead of
 // vanishing. Returns an error message, or null once the restart is under way.
 string? SpawnRestart(string via)
@@ -431,18 +432,34 @@ string? SpawnRestart(string via)
         if (dir.GetFiles("*.csproj").Length > 0) { projectDir = dir.FullName; break; }
         dir = dir.Parent;
     }
-    if (projectDir == null) return "Cannot find project directory";
-
     var pid = Environment.ProcessId;
-    var escaped = projectDir.Replace("'", "''");
-    var buildLog = Path.Combine(Path.GetTempPath(), "webterm-restart-build.log").Replace("'", "''");
-    var script = $"while(Get-Process -Id {pid} -EA SilentlyContinue){{Start-Sleep -Milliseconds 500}}; " +
+    var wait = $"while(Get-Process -Id {pid} -EA SilentlyContinue){{Start-Sleep -Milliseconds 500}}; ";
+    string script;
+    if (projectDir != null)
+    {
+        var escaped = projectDir.Replace("'", "''");
+        var buildLog = Path.Combine(Path.GetTempPath(), "webterm-restart-build.log").Replace("'", "''");
+        script = wait +
                  $"Set-Location '{escaped}'; $o = dotnet build 2>&1; " +
                  $"if($LASTEXITCODE -eq 0){{ $env:WEBTERM_HIDDEN_CONSOLE='1'; dotnet run }} else {{ $o | Set-Content '{buildLog}'; Start-Process notepad '{buildLog}' }}";
+    }
+    else
+    {
+        var exePath = Environment.ProcessPath;
+        if (exePath is null) return "Cannot find project directory or executable path";
+        // Under the dotnet host (`dotnet webterm.dll`), args[0] is the dll and must be passed on too.
+        var args = Environment.GetCommandLineArgs();
+        var isHost = Path.GetFileNameWithoutExtension(exePath).Equals("dotnet", StringComparison.OrdinalIgnoreCase);
+        var argLine = string.Join(" ", (isHost ? args : args.Skip(1)).Select(Agents.QuoteWindowsArg));
+        var q = (string s) => "'" + s.Replace("'", "''") + "'";
+        script = wait +
+                 $"Start-Process -FilePath {q(exePath)} -WorkingDirectory {q(Environment.CurrentDirectory)}" +
+                 (argLine.Length > 0 ? $" -ArgumentList {q(argLine)}" : "");
+    }
     Process.Start(new ProcessStartInfo
     {
         FileName = "powershell.exe",
-        Arguments = $"-NoProfile -Command \"{script}\"",
+        Arguments = $"-NoProfile -EncodedCommand {Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(script))}",
         UseShellExecute = true,
         WindowStyle = ProcessWindowStyle.Hidden
     });
